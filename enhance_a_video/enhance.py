@@ -2,6 +2,13 @@ import torch
 from einops import rearrange
 from .globals import get_enhance_weight, get_num_frames
 
+try:
+    from liger_kernel.ops.softmax import LigerSoftmaxFunction
+
+    liger_available = True
+except Exception as e:
+    liger_available = False
+
 @torch.compiler.disable()
 def get_feta_scores(query, key):
     img_q, img_k = query, key
@@ -33,7 +40,11 @@ def feta_score(query_image, key_image, head_dim, num_frames):
     query_image = query_image * scale
     attn_temp = query_image @ key_image.transpose(-2, -1)  # translate attn to float32
     attn_temp = attn_temp.to(torch.float32)
-    attn_temp = attn_temp.softmax(dim=-1)
+    
+    if liger_available:
+        LigerSoftmaxFunction.apply(attn_temp)
+    else:
+        attn_temp = attn_temp.softmax(dim=-1)
 
     # Reshape to [batch_size * num_tokens, num_frames, num_frames]
     attn_temp = attn_temp.reshape(-1, num_frames, num_frames)

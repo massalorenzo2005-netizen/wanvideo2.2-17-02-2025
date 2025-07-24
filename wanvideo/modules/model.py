@@ -26,7 +26,7 @@ try:
     from liger_kernel.transformers import LigerLayerNorm
 
     liger_available = True
-except Exeption as e:
+except Exception as e:
     liger_available = False
 
 from .attention import attention

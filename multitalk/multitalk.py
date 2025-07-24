@@ -7,6 +7,13 @@ from ..wanvideo.modules.attention import attention
 
 from comfy import model_management as mm
 
+try:
+    from liger_kernel.ops.softmax import LigerSoftmaxFunction
+
+    liger_available = True
+except Exception as e:
+    liger_available = False
+
 def timestep_transform(
     t,
     shift=5.0,
@@ -58,8 +65,10 @@ def calculate_x_ref_attn_map(visual_q, ref_k, ref_target_masks, mode='mean', att
     if attn_bias is not None:
         attn = attn + attn_bias
 
-    x_ref_attn_map_source = attn.softmax(-1) # B, H, x_seqlens, ref_seqlens
-
+    if liger_available:
+        x_ref_attn_map_source = LigerSoftmaxFunction.apply(attn)
+    else:
+        x_ref_attn_map_source = attn.softmax(-1) # B, H, x_seqlens, ref_seqlens
 
     x_ref_attn_maps = []
     ref_target_masks = ref_target_masks.to(visual_q.dtype)
