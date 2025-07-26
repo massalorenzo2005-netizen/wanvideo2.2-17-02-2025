@@ -46,7 +46,7 @@ def feta_score(query_image, key_image, head_dim, num_frames):
     attn_temp = attn_temp.to(torch.float32)
     
     if liger_available:
-        attn_temp = liger_softmax(attn_tmp)
+        attn_temp = liger_softmax(attn_temp)
     else:
         attn_temp = attn_temp.softmax(dim=-1)
 
