@@ -47,9 +47,8 @@ try:
         return LigerRopeFunction.apply(q, k, cos, sin, position_ids, unsqueeze_dim)
 
     def apply_rope_liger(xq, xk, freqs_cis):
-        freqs_cis = freqs_cis.float().to(xq.device)
-        cos, sin = freqs_cis.cos(), freqs_cis.sin()
-        # cos, sin = rearrange(cos, 'n d -> 1 1 n d'), rearrange(sin, 'n d -> 1 1 n d')
+        cos = freqs_cis[..., 0]
+        sin = freqs_cis[..., 1]
         tt_q, tt_k = liger_rotary_pos_emb(xq, xk, cos, sin)
         return tt_q, tt_k
 
