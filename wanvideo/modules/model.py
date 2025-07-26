@@ -23,7 +23,6 @@ except:
 try:
     from liger_kernel.ops.rms_norm import LigerRMSNormFunction
     from liger_kernel.ops.layer_norm import LigerLayerNormFunction
-    from liger_kernel.ops.rope import LigerRopeFunction
     from liger_kernel.transformers import LigerLayerNorm
     
     @torch.compiler.disable
@@ -41,16 +40,6 @@ try:
         @torch.compiler.disable
         def forward(self, *args, **kwargs):
             return super().forward(*args, **kwargs)
-
-    @torch.compiler.disable
-    def liger_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-        return LigerRopeFunction.apply(q, k, cos, sin, position_ids, unsqueeze_dim)
-
-    def apply_rope_liger(xq, xk, freqs_cis):
-        cos = freqs_cis[..., 0]
-        sin = freqs_cis[..., 1]
-        tt_q, tt_k = liger_rotary_pos_emb(xq, xk, cos, sin)
-        return tt_q, tt_k
 
     liger_available = True
 except Exception as e:
@@ -745,10 +734,7 @@ class WanAttentionBlock(nn.Module):
 
         #RoPE
         if self.rope_func == "comfy":
-            if liger_available: # TODO: add switch
-                q, k = apply_rope_liger(q, k, freqs)
-            else:
-                q, k = apply_rope_comfy(q, k, freqs)
+            q, k = apply_rope_comfy(q, k, freqs)
         elif self.rope_func == "comfy_chunked":
             q, k = apply_rope_comfy_chunked(q, k, freqs)
         else:
