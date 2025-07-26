@@ -6,6 +6,10 @@ try:
     from liger_kernel.ops.softmax import LigerSoftmaxFunction
 
     liger_available = True
+    
+    @torch.compiler.disable
+    def liger_softmax(attn):
+        return LigerSoftmaxFunction.apply(attn)
 except Exception as e:
     liger_available = False
 
@@ -42,7 +46,7 @@ def feta_score(query_image, key_image, head_dim, num_frames):
     attn_temp = attn_temp.to(torch.float32)
     
     if liger_available:
-        attn_temp = LigerSoftmaxFunction.apply(attn_temp)
+        attn_temp = liger_softmax(attn_tmp)
     else:
         attn_temp = attn_temp.softmax(dim=-1)
 

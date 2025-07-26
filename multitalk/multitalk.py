@@ -11,6 +11,10 @@ try:
     from liger_kernel.ops.softmax import LigerSoftmaxFunction
 
     liger_available = True
+    
+    @torch.compiler.disable
+    def liger_softmax(attn):
+        return LigerSoftmaxFunction.apply(attn)
 except Exception as e:
     liger_available = False
 
@@ -66,7 +70,7 @@ def calculate_x_ref_attn_map(visual_q, ref_k, ref_target_masks, mode='mean', att
         attn = attn + attn_bias
 
     if liger_available:
-        x_ref_attn_map_source = LigerSoftmaxFunction.apply(attn)
+        x_ref_attn_map_source = liger_softmax(attn)
     else:
         x_ref_attn_map_source = attn.softmax(-1) # B, H, x_seqlens, ref_seqlens
 

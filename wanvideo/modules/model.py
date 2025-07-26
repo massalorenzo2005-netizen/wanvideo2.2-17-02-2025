@@ -24,6 +24,30 @@ try:
     from liger_kernel.ops.rms_norm import LigerRMSNormFunction
     from liger_kernel.ops.layer_norm import LigerLayerNormFunction
     from liger_kernel.transformers import LigerLayerNorm
+    
+    @torch.compiler.disable
+    def liger_rms_norm(x, weight, eps):
+        return LigerRMSNormFunction.apply(
+                x,
+                weight,
+                eps,
+                offset=0.0,
+                casting_mode="llama",
+                in_place=True,
+                row_mode=None,
+            )
+    
+    @torch.compiler.disable
+    def liger_layer_norm(x, weight, bias, eps):
+        return LigerLayerNormFunction.apply(x, weight, bias, eps)
+    
+    class MyLigerLayerNorm(LigerLayerNorm):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+        
+        @torch.compiler.disable
+        def forward(self, *args, **kwargs):
+            return super().forward(*args, **kwargs)
 
     liger_available = True
 except Exception as e:
@@ -213,15 +237,7 @@ class WanRMSNorm(nn.Module):
             x(Tensor): Shape [B, L, C]
         """       
         if liger_available: 
-            return LigerRMSNormFunction.apply(
-                x,
-                self.weight,
-                self.eps,
-                offset=0.0,
-                casting_mode="llama",
-                in_place=True,
-                row_mode=None,
-            )
+            return liger_rms_norm(x, self.weight, self.eps)
         else:
             use_chunked = num_chunks > 1
             if use_chunked:
@@ -263,7 +279,7 @@ class WanLayerNorm(nn.LayerNorm):
             x(Tensor): Shape [B, L, C]
         """
         if liger_available:
-            return LigerLayerNormFunction.apply(x, self.weight, self.bias, self.eps)
+            return liger_layer_norm(x, self.weight, self.bias, self.eps)
         else:
             return super().forward(x)
 
@@ -960,9 +976,9 @@ class MLPProj(torch.nn.Module):
 
         if liger_available:
             self.proj = torch.nn.Sequential(
-                LigerLayerNorm(in_dim), torch.nn.Linear(in_dim, in_dim),
+                MyLigerLayerNorm(in_dim), torch.nn.Linear(in_dim, in_dim),
                 torch.nn.GELU(), torch.nn.Linear(in_dim, out_dim),
-                LigerLayerNorm(out_dim))
+                MyLigerLayerNorm(out_dim))
         else:
             self.proj = torch.nn.Sequential(
                 torch.nn.LayerNorm(in_dim), torch.nn.Linear(in_dim, in_dim),
