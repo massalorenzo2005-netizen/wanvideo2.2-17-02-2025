@@ -278,7 +278,7 @@ class WanLayerNorm(nn.LayerNorm):
         Args:
             x(Tensor): Shape [B, L, C]
         """
-        if liger_available:
+        if liger_available and self.elementwise_affine:
             return liger_layer_norm(x, self.weight, self.bias, self.eps)
         else:
             return super().forward(x)
