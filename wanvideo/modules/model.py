@@ -27,15 +27,7 @@ try:
     
     @torch.compiler.disable
     def liger_rms_norm(x, weight, eps):
-        return LigerRMSNormFunction.apply(
-                x,
-                weight,
-                eps,
-                offset=0.0,
-                casting_mode="llama",
-                in_place=True,
-                row_mode=None,
-            )
+        return LigerRMSNormFunction.apply(x, weight, eps, 0.0, "llama", True)
     
     @torch.compiler.disable
     def liger_layer_norm(x, weight, bias, eps):
