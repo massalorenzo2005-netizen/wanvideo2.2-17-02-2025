@@ -53,11 +53,13 @@ def apply_rope_comfy_chunked(xq, xk, freqs_cis, num_chunks=4):
         
         slices = [slice(None)] * len(xq.shape)
         slices[seq_dim] = slice(start_idx, end_idx)
-        
-        freq_slices = [slice(None)] * len(freqs_cis.shape)
-        if seq_dim < len(freqs_cis.shape):
+
+        if len(freqs_cis.shape) <= seq_dim:
+            freqs_chunk = freqs_cis
+        else:
+            freq_slices = [slice(None)] * len(freqs_cis.shape)
             freq_slices[seq_dim] = slice(start_idx, end_idx)
-        freqs_chunk = freqs_cis[tuple(freq_slices)]
+            freqs_chunk = freqs_cis[tuple(freq_slices)]
         
         xq_chunk = xq[tuple(slices)]
         xq_chunk_ = xq_chunk.to(dtype=freqs_cis.dtype).reshape(*xq_chunk.shape[:-1], -1, 1, 2)
@@ -1644,30 +1646,34 @@ class WanModel(ModelMixin, ConfigMixin):
                 pred_id = self.teacache_state.new_prediction(cache_device=self.cache_device)
                 should_calc = True                
             else:
-                previous_modulated_input = self.teacache_state.get(pred_id)['previous_modulated_input']
-                previous_modulated_input = previous_modulated_input.to(device)
-                previous_residual = self.teacache_state.get(pred_id)['previous_residual']
-                accumulated_rel_l1_distance = self.teacache_state.get(pred_id)['accumulated_rel_l1_distance']
-
-                if self.teacache_use_coefficients:
-                    rescale_func = np.poly1d(self.teacache_coefficients[self.teacache_mode])
-                    temb = e if self.teacache_mode == 'e' else e0
-                    accumulated_rel_l1_distance += rescale_func((
-                        (temb.to(device) - previous_modulated_input).abs().mean() / previous_modulated_input.abs().mean()
-                        ).cpu().item())
-                    del temb
-                else:
-                    temb_relative_l1 = relative_l1_distance(previous_modulated_input, e0)
-                    accumulated_rel_l1_distance = accumulated_rel_l1_distance.to(e0.device) + temb_relative_l1
-                    del temb_relative_l1
-
-
-                if accumulated_rel_l1_distance < self.rel_l1_thresh:
-                    should_calc = False
-                else:
+                if not self.teacache_state.has_prediction(pred_id):
+                    pred_id = self.teacache_state.new_prediction(cache_device=self.cache_device)
                     should_calc = True
-                    accumulated_rel_l1_distance = torch.tensor(0.0, dtype=torch.float32, device=device)
-                accumulated_rel_l1_distance = accumulated_rel_l1_distance.to(self.cache_device)
+                else:
+                    previous_modulated_input = self.teacache_state.get(pred_id)['previous_modulated_input']
+                    previous_modulated_input = previous_modulated_input.to(device)
+                    previous_residual = self.teacache_state.get(pred_id)['previous_residual']
+                    accumulated_rel_l1_distance = self.teacache_state.get(pred_id)['accumulated_rel_l1_distance']
+    
+                    if self.teacache_use_coefficients:
+                        rescale_func = np.poly1d(self.teacache_coefficients[self.teacache_mode])
+                        temb = e if self.teacache_mode == 'e' else e0
+                        accumulated_rel_l1_distance += rescale_func((
+                            (temb.to(device) - previous_modulated_input).abs().mean() / previous_modulated_input.abs().mean()
+                            ).cpu().item())
+                        del temb
+                    else:
+                        temb_relative_l1 = relative_l1_distance(previous_modulated_input, e0)
+                        accumulated_rel_l1_distance = accumulated_rel_l1_distance.to(e0.device) + temb_relative_l1
+                        del temb_relative_l1
+    
+    
+                    if accumulated_rel_l1_distance < self.rel_l1_thresh:
+                        should_calc = False
+                    else:
+                        should_calc = True
+                        accumulated_rel_l1_distance = torch.tensor(0.0, dtype=torch.float32, device=device)
+                    accumulated_rel_l1_distance = accumulated_rel_l1_distance.to(self.cache_device)
 
             previous_modulated_input = e.to(self.cache_device).clone() if (self.teacache_use_coefficients and self.teacache_mode == 'e') else e0.to(self.cache_device).clone()
            
