@@ -1338,7 +1338,7 @@ class WanVideoModelLoaderDFloat11:
             model_type = "t2v"
             model_variant = "14B"
             
-            TRANSFORMER_CONFIG ={'dim': 5120, 'in_features': 5120, 'out_features': 5120, 'ffn_dim': 13824, 'ffn2_dim': 13824, 'eps': 1e-06, 'freq_dim': 256, 'in_dim': 16, 'model_type': 't2v', 'out_dim': 16, 'text_len': 512, 'num_heads': 40, 'num_layers': 40, 'attention_mode': 'sageattn', 'rope_func': 'comfy', 'main_device': device(type='cuda', index=0), 'offload_device': device(type='cpu'), 'teacache_coefficients': {'e': [-5784.54975374, 5449.50911966, -1811.16591783, 256.27178429, -13.02252404], 'e0': [-303318.725, 49053.7029, -2655.30556, 58.7365115, -0.315583525]}, 'magcache_ratios': array([1.     , 1.     , 1.02504, 1.03017, 1.00025, 1.00251, 0.9985 ,
+            TRANSFORMER_CONFIG ={'dim': 5120, 'in_features': 5120, 'out_features': 5120, 'ffn_dim': 13824, 'ffn2_dim': 13824, 'eps': 1e-06, 'freq_dim': 256, 'in_dim': 16, 'model_type': 't2v', 'out_dim': 16, 'text_len': 512, 'num_heads': 40, 'num_layers': 40, 'attention_mode': 'sageattn', 'rope_func': 'comfy', 'main_device': torch.device(type='cuda', index=0), 'offload_device': torch.device('cpu'), 'teacache_coefficients': {'e': [-5784.54975374, 5449.50911966, -1811.16591783, 256.27178429, -13.02252404], 'e0': [-303318.725, 49053.7029, -2655.30556, 58.7365115, -0.315583525]}, 'magcache_ratios': np.array([1.     , 1.     , 1.02504, 1.03017, 1.00025, 1.00251, 0.9985 ,
        0.99962, 0.99779, 0.99771, 0.9966 , 0.99658, 0.99482, 0.99476,
        0.99467, 0.99451, 0.99664, 0.99656, 0.99434, 0.99431, 0.99533,
        0.99545, 0.99468, 0.99465, 0.99438, 0.99434, 0.99516, 0.99517,
@@ -1358,7 +1358,7 @@ class WanVideoModelLoaderDFloat11:
             model_type = "i2v"
             model_variant = "14B"
             
-            TRANSFORMER_CONFIG = {'dim': 5120, 'in_features': 5120, 'out_features': 5120, 'ffn_dim': 13824, 'ffn2_dim': 13824, 'eps': 1e-06, 'freq_dim': 256, 'in_dim': 36, 'model_type': 't2v', 'out_dim': 16, 'text_len': 512, 'num_heads': 40, 'num_layers': 40, 'attention_mode': 'sageattn', 'rope_func': 'comfy', 'main_device': device(type='cuda', index=0), 'offload_device': device(type='cpu'), 'teacache_coefficients': {'e': [-5784.54975374, 5449.50911966, -1811.16591783, 256.27178429, -13.02252404], 'e0': [-303318.725, 49053.7029, -2655.30556, 58.7365115, -0.315583525]}, 'magcache_ratios': np.array([1.     , 1.     , 1.02504, 1.03017, 1.00025, 1.00251, 0.9985 ,
+            TRANSFORMER_CONFIG = {'dim': 5120, 'in_features': 5120, 'out_features': 5120, 'ffn_dim': 13824, 'ffn2_dim': 13824, 'eps': 1e-06, 'freq_dim': 256, 'in_dim': 36, 'model_type': 't2v', 'out_dim': 16, 'text_len': 512, 'num_heads': 40, 'num_layers': 40, 'attention_mode': 'sageattn', 'rope_func': 'comfy', 'main_device': torch.device(type='cuda', index=0), 'offload_device': torch.device('cpu'), 'teacache_coefficients': {'e': [-5784.54975374, 5449.50911966, -1811.16591783, 256.27178429, -13.02252404], 'e0': [-303318.725, 49053.7029, -2655.30556, 58.7365115, -0.315583525]}, 'magcache_ratios': np.array([1.     , 1.     , 1.02504, 1.03017, 1.00025, 1.00251, 0.9985 ,
        0.99962, 0.99779, 0.99771, 0.9966 , 0.99658, 0.99482, 0.99476,
        0.99467, 0.99451, 0.99664, 0.99656, 0.99434, 0.99431, 0.99533,
        0.99545, 0.99468, 0.99465, 0.99438, 0.99434, 0.99516, 0.99517,
