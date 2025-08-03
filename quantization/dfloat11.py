@@ -1,3 +1,6 @@
+import os
+from comfy.cli_args import args
+
 def rename_diffusers_to_comfy(state_dict):
     new_state_dict = {}
     
@@ -104,3 +107,10 @@ def rename_diffusers_to_comfy(state_dict):
             new_state_dict[new_key] = state_dict[key]
     
     return new_state_dict
+
+def locate_dfloat11(model):
+    base_path = os.path.abspath(args.base_directory)
+    model_dir = os.path.join(base_path, "models", "dfloat11", model)
+    if not os.path.exists(model_dir):
+        raise FileNotFoundError(f"Subdirectory {model_dir} not found.")
+    return model_dir

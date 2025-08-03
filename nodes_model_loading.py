@@ -1300,7 +1300,7 @@ class WanVideoModelLoaderDFloat11:
         except ImportError as e:
             raise ImportError("DFloat11 is not installed. Install it with 'pip install -U dfloat11[cuda12]'")
 
-        from .quantization.dfloat11 import rename_diffusers_to_comfy
+        from .quantization.dfloat11 import rename_diffusers_to_comfy, locate_dfloat11
 
         transformer = None
         mm.unload_all_models()
@@ -1331,8 +1331,7 @@ class WanVideoModelLoaderDFloat11:
             except:
                 pass
  
-
-        model_path = folder_paths.get_full_path_or_raise("dfloat11", model)
+        model_path = locate_dfloat11(model)
       
         # Hardcode configs for now
         if "T2V" in model:
