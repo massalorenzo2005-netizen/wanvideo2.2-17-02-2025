@@ -1261,7 +1261,7 @@ class WanVideoModelLoaderDFloat11:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "dfloat11_model": (["Wan2.2-T2V-A14B-DF11","Wan2.2-T2V-A14B-2-DF11","Wan2.2-I2V-A14B-DF11","Wan2.2-I2V-A14B-2-DF11","Wan2.1-T2V-14B-DF11"], {"tooltip": "These models are loaded from the 'ComfyUI/models/dfloat11' -folder",}),
+                "model": (["Wan2.2-T2V-A14B-DF11","Wan2.2-T2V-A14B-2-DF11","Wan2.2-I2V-A14B-DF11","Wan2.2-I2V-A14B-2-DF11","Wan2.1-T2V-14B-DF11"], {"tooltip": "These models are loaded from the 'ComfyUI/models/dfloat11' -folder",}),
 
             #"base_precision": (["fp32", "bf16", "fp16", "fp16_fast"], {"default": "bf16"}),
             "load_device": (["main_device", "offload_device"], {"default": "main_device", "tooltip": "Initial device to load the model to, NOT recommended with the larger models unless you have 48GB+ VRAM"}),
