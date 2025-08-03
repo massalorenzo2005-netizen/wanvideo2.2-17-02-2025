@@ -1256,6 +1256,195 @@ class WanVideoModelLoader:
 
         return (patcher,)
     
+class WanVideoModelLoaderDFloat11:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "dfloat11_model": (["Wan2.2-T2V-A14B-DF11","Wan2.2-T2V-A14B-2-DF11","Wan2.2-I2V-A14B-DF11","Wan2.2-I2V-A14B-2-DF11","Wan2.1-T2V-14B-DF11"], {"tooltip": "These models are loaded from the 'ComfyUI/models/dfloat11' -folder",}),
+
+            #"base_precision": (["fp32", "bf16", "fp16", "fp16_fast"], {"default": "bf16"}),
+            "load_device": (["main_device", "offload_device"], {"default": "main_device", "tooltip": "Initial device to load the model to, NOT recommended with the larger models unless you have 48GB+ VRAM"}),
+            },
+            "optional": {
+                "attention_mode": ([
+                    "sdpa",
+                    "flash_attn_2",
+                    "flash_attn_3",
+                    "sageattn",
+                    "sageattn_3",
+                    "flex_attention",
+                    "radial_sage_attention",
+                    ], {"default": "sdpa"}),
+                "compile_args": ("WANCOMPILEARGS", ),
+                "block_swap_args": ("BLOCKSWAPARGS", ),
+                # TODO
+                # "lora": ("WANVIDLORA", {"default": None}),
+                # "vram_management_args": ("VRAM_MANAGEMENTARGS", {"default": None, "tooltip": "Alternative offloading method from DiffSynth-Studio, more aggressive in reducing memory use than block swapping, but can be slower"}),
+                # "vace_model": ("VACEPATH", {"default": None, "tooltip": "VACE model to use when not using model that has it included"}),
+                # "fantasytalking_model": ("FANTASYTALKINGMODEL", {"default": None, "tooltip": "FantasyTalking model https://github.com/Fantasy-AMAP"}),
+                # "multitalk_model": ("MULTITALKMODEL", {"default": None, "tooltip": "Multitalk model"}),
+            }
+        }
+
+    RETURN_TYPES = ("WANVIDEOMODEL",)
+    RETURN_NAMES = ("model", )
+    FUNCTION = "loadmodel"
+    CATEGORY = "WanVideoWrapper"
+
+    def loadmodel(self, model, base_precision, load_device,
+                  compile_args=None, attention_mode="sdpa", block_swap_args=None,):
+        base_precision = "bf16"
+        try:
+            from dfloat11 import DFloat11Model
+        except ImportError as e:
+            raise ImportError("DFloat11 is not installed. Install it with 'pip install -U dfloat11[cuda12]'")
+
+        from .quantization.dfloat11 import rename_diffusers_to_comfy
+
+        transformer = None
+        mm.unload_all_models()
+        mm.cleanup_models()
+        mm.soft_empty_cache()
+        manual_offloading = True
+        
+        if "sage" in attention_mode:
+            try:
+                from sageattention import sageattn
+            except Exception as e:
+                raise ValueError(f"Can't import SageAttention: {str(e)}")
+                
+        manual_offloading = True
+        transformer_load_device = device if load_device == "main_device" else offload_device
+        
+        base_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp16_fast": torch.float16, "fp32": torch.float32}[base_precision]
+        
+        if base_precision == "fp16_fast":
+            if hasattr(torch.backends.cuda.matmul, "allow_fp16_accumulation"):
+                torch.backends.cuda.matmul.allow_fp16_accumulation = True
+            else:
+                raise ValueError("torch.backends.cuda.matmul.allow_fp16_accumulation is not available in this version of torch, requires torch 2.7.0.dev2025 02 26 nightly minimum currently")
+        else:
+            try:
+                if hasattr(torch.backends.cuda.matmul, "allow_fp16_accumulation"):
+                    torch.backends.cuda.matmul.allow_fp16_accumulation = False
+            except:
+                pass
+ 
+
+        model_path = folder_paths.get_full_path_or_raise("dfloat11", model)
+      
+        # Hardcode configs for now
+        if "T2V" in model:
+            model_type = "t2v"
+            model_variant = "14B"
+            
+            TRANSFORMER_CONFIG ={'dim': 5120, 'in_features': 5120, 'out_features': 5120, 'ffn_dim': 13824, 'ffn2_dim': 13824, 'eps': 1e-06, 'freq_dim': 256, 'in_dim': 16, 'model_type': 't2v', 'out_dim': 16, 'text_len': 512, 'num_heads': 40, 'num_layers': 40, 'attention_mode': 'sageattn', 'rope_func': 'comfy', 'main_device': device(type='cuda', index=0), 'offload_device': device(type='cpu'), 'teacache_coefficients': {'e': [-5784.54975374, 5449.50911966, -1811.16591783, 256.27178429, -13.02252404], 'e0': [-303318.725, 49053.7029, -2655.30556, 58.7365115, -0.315583525]}, 'magcache_ratios': array([1.     , 1.     , 1.02504, 1.03017, 1.00025, 1.00251, 0.9985 ,
+       0.99962, 0.99779, 0.99771, 0.9966 , 0.99658, 0.99482, 0.99476,
+       0.99467, 0.99451, 0.99664, 0.99656, 0.99434, 0.99431, 0.99533,
+       0.99545, 0.99468, 0.99465, 0.99438, 0.99434, 0.99516, 0.99517,
+       0.99384, 0.9938 , 0.99404, 0.99401, 0.99517, 0.99516, 0.99409,
+       0.99408, 0.99428, 0.99426, 0.99347, 0.99343, 0.99418, 0.99416,
+       0.99271, 0.99269, 0.99313, 0.99311, 0.99215, 0.99215, 0.99218,
+       0.99215, 0.99216, 0.99217, 0.99163, 0.99161, 0.99138, 0.99135,
+       0.98982, 0.9898 , 0.98996, 0.98995, 0.9887 , 0.98866, 0.98772,
+       0.9877 , 0.98767, 0.98765, 0.98573, 0.9857 , 0.98501, 0.98498,
+       0.9838 , 0.98376, 0.98177, 0.98173, 0.98037, 0.98035, 0.97678,
+       0.97677, 0.97546, 0.97543, 0.97184, 0.97183, 0.96711, 0.96708,
+       0.96349, 0.96345, 0.95629, 0.95625, 0.94926, 0.94929, 0.93964,
+       0.93961, 0.92511, 0.92504, 0.90693, 0.90678, 0.8796 , 0.87945,
+       0.86111, 0.86189]), 'vace_layers': None, 'vace_in_dim': None, 'inject_sample_info': False, 'add_ref_conv': False, 'in_dim_ref_conv': None, 'add_control_adapter': False}
+            
+        elif "I2V" in model:
+            model_type = "i2v"
+            model_variant = "14B"
+            
+            TRANSFORMER_CONFIG = {'dim': 5120, 'in_features': 5120, 'out_features': 5120, 'ffn_dim': 13824, 'ffn2_dim': 13824, 'eps': 1e-06, 'freq_dim': 256, 'in_dim': 36, 'model_type': 't2v', 'out_dim': 16, 'text_len': 512, 'num_heads': 40, 'num_layers': 40, 'attention_mode': 'sageattn', 'rope_func': 'comfy', 'main_device': device(type='cuda', index=0), 'offload_device': device(type='cpu'), 'teacache_coefficients': {'e': [-5784.54975374, 5449.50911966, -1811.16591783, 256.27178429, -13.02252404], 'e0': [-303318.725, 49053.7029, -2655.30556, 58.7365115, -0.315583525]}, 'magcache_ratios': np.array([1.     , 1.     , 1.02504, 1.03017, 1.00025, 1.00251, 0.9985 ,
+       0.99962, 0.99779, 0.99771, 0.9966 , 0.99658, 0.99482, 0.99476,
+       0.99467, 0.99451, 0.99664, 0.99656, 0.99434, 0.99431, 0.99533,
+       0.99545, 0.99468, 0.99465, 0.99438, 0.99434, 0.99516, 0.99517,
+       0.99384, 0.9938 , 0.99404, 0.99401, 0.99517, 0.99516, 0.99409,
+       0.99408, 0.99428, 0.99426, 0.99347, 0.99343, 0.99418, 0.99416,
+       0.99271, 0.99269, 0.99313, 0.99311, 0.99215, 0.99215, 0.99218,
+       0.99215, 0.99216, 0.99217, 0.99163, 0.99161, 0.99138, 0.99135,
+       0.98982, 0.9898 , 0.98996, 0.98995, 0.9887 , 0.98866, 0.98772,
+       0.9877 , 0.98767, 0.98765, 0.98573, 0.9857 , 0.98501, 0.98498,
+       0.9838 , 0.98376, 0.98177, 0.98173, 0.98037, 0.98035, 0.97678,
+       0.97677, 0.97546, 0.97543, 0.97184, 0.97183, 0.96711, 0.96708,
+       0.96349, 0.96345, 0.95629, 0.95625, 0.94926, 0.94929, 0.93964,
+       0.93961, 0.92511, 0.92504, 0.90693, 0.90678, 0.8796 , 0.87945,
+       0.86111, 0.86189]), 'vace_layers': None, 'vace_in_dim': None, 'inject_sample_info': False, 'add_ref_conv': False, 'in_dim_ref_conv': None, 'add_control_adapter': False}
+            
+        else:
+            raise ValueError("DFloat11 unsupported model type. Only T2VV and I2V are supported")
+
+        log.info(f"Model type: {model_type}")
+        log.info(f"Model variant detected: {model_variant}")
+        
+        with init_empty_weights():
+            transformer = WanModel(**TRANSFORMER_CONFIG)
+        
+        latent_format=Wan22 if "2.2" in model else Wan21
+        comfy_model = WanVideoModel(
+            WanVideoModelConfig(base_dtype, latent_format=latent_format),
+            model_type=comfy.model_base.ModelType.FLOW,
+            device=device,
+        )
+        dtype = base_dtype
+        
+        log.info("Using DFloat11 to load and assign model weights to device...")
+        
+        # dummy diffusers model
+        # TODO: dehardcode the URLs
+        from diffusers import WanTransformer3DModel
+        if model == "Wan2.2-I2V-A14B-DF11":
+            dummy_transformer = WanTransformer3DModel.from_config("Wan-AI/Wan2.2-I2V-A14B-Diffusers", subfolder="transformer", torch_dtype=base_dtype)
+        elif model == "Wan2.2-I2V-A14B-2-DF11":
+            dummy_transformer = WanTransformer3DModel.from_config("Wan-AI/Wan2.2-I2V-A14B-Diffusers", subfolder="transformer_2", torch_dtype=base_dtype)
+        elif model == "Wan2.2-T2V-A14B-DF11":
+            dummy_transformer = WanTransformer3DModel.from_config("Wan-AI/Wan2.2-T2V-A14B-Diffusers", subfolder="transformer", torch_dtype=base_dtype)
+        else:
+            dummy_transformer = WanTransformer3DModel.from_config("Wan-AI/Wan2.2-T2V-A14B-Diffusers", subfolder="transformer_2", torch_dtype=base_dtype)
+        DFloat11Model.from_pretrained(model_path, device=transformer_load_device, bfloat16_model=dummy_transformer)
+        
+        transformer.load_state_dict(rename_diffusers_to_comfy(dummy_transformer.state_dict()), strict=True)
+        del dummy_transformer
+        gc.collect()
+        mm.soft_empty_cache()
+
+        comfy_model.diffusion_model = transformer
+        comfy_model.load_device = transformer_load_device
+        
+        patcher = comfy.model_patcher.ModelPatcher(comfy_model, device, offload_device)
+        patcher.model.is_patched = False
+
+        if load_device == "offload_device" and patcher.model.diffusion_model.device != offload_device:
+            log.info(f"Moving diffusion model from {patcher.model.diffusion_model.device} to {offload_device}")
+            patcher.model.diffusion_model.to(offload_device)
+            gc.collect()
+            mm.soft_empty_cache()
+
+        patcher.model["dtype"] = base_dtype
+        patcher.model["base_path"] = model_path
+        patcher.model["model_name"] = model
+        patcher.model["manual_offloading"] = manual_offloading
+        patcher.model["quantization"] = "disabled"
+        patcher.model["auto_cpu_offload"] = False
+        patcher.model["control_lora"] = None
+        patcher.model["compile_args"] = compile_args
+        patcher.model["gguf"] = False
+
+        if 'transformer_options' not in patcher.model_options:
+            patcher.model_options['transformer_options'] = {}
+        patcher.model_options["transformer_options"]["block_swap_args"] = block_swap_args
+        patcher.model_options["transformer_options"]["linear_with_lora"] = False # if not merge_loras else False
+
+        for model in mm.current_loaded_models:
+            if model._model() == patcher:
+                mm.current_loaded_models.remove(model)
+
+        return (patcher,)
+    
 # class WanVideoSaveModel:
 #     @classmethod
 #     def INPUT_TYPES(s):
