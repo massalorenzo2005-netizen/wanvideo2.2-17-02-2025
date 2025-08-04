@@ -117,6 +117,21 @@ def rename_diffusers_to_comfy(state_dict):
     
     return new_state_dict
 
+def rename_pattern_name_to_comfy(pattern_dict):
+    pattern_dict["blocks\\.\\d+"] = [
+        "self_attn.q",
+        "self_attn.k",
+        "self_attn.v",
+        "self_attn.o",
+        "cross_attn.q",
+        "cross_attn.k",
+        "cross_attn.v",
+        "cross_attn.o",
+        "ffn.0",
+        "ffn.2"
+    ]
+    return pattern_dict
+
 def locate_dfloat11(model):
     base_path = os.path.abspath(folder_paths.base_path)
     model_dir = os.path.join(base_path, "models", "dfloat11", model)
@@ -143,6 +158,7 @@ def load_and_replace_tensors(model, directory_path, dfloat11_config, cpu_offload
     threads_per_block = dfloat11_config['threads_per_block']
     bytes_per_thread  = dfloat11_config['bytes_per_thread']
     pattern_dict      = dfloat11_config['pattern_dict']
+    pattern_dict      = rename_pattern_name_to_comfy(pattern_dict)
     
     # Get all .safetensors files in the directory
     safetensors_files = [f for f in os.listdir(directory_path) if f.endswith('.safetensors')]
@@ -218,10 +234,7 @@ def load_and_replace_tensors(model, directory_path, dfloat11_config, cpu_offload
                                         parts = attr_path.split('.')
                                         target = module
                                         for p in parts:
-                                            try:
-                                                target = getattr(target, p)
-                                            except Exception as e:
-                                                raise ValueError(f"Not found: {attr_path}\n{p}\n", str(e))
+                                            target = getattr(target, p)
 
                                         tmp = target.weight
                                         delattr(target, 'weight')
