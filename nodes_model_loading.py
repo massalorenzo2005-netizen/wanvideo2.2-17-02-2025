@@ -1296,10 +1296,11 @@ class WanVideoModelLoaderDFloat11:
                   compile_args=None, attention_mode="sdpa", block_swap_args=None,):
         base_precision = "bf16"
         try:
-            from dfloat11 import DFloat11Model
+            import dfloat11
         except ImportError as e:
             raise ImportError("DFloat11 is not installed. Install it with 'pip install -U dfloat11[cuda12]'")
 
+        from .quantization.dfloat11 import DFloat11Model
         from .quantization.dfloat11 import rename_diffusers_to_comfy, locate_dfloat11
 
         transformer = None
@@ -1394,20 +1395,8 @@ class WanVideoModelLoaderDFloat11:
         log.info("Using DFloat11 to load and assign model weights to device...")
         
         # dummy diffusers model
-        # TODO: dehardcode the URLs
-        from diffusers import WanTransformer3DModel
-        if model == "Wan2.2-I2V-A14B-DF11":
-            dummy_transformer = WanTransformer3DModel.from_config("Wan-AI/Wan2.2-I2V-A14B-Diffusers", subfolder="transformer", torch_dtype=base_dtype)
-        elif model == "Wan2.2-I2V-A14B-2-DF11":
-            dummy_transformer = WanTransformer3DModel.from_config("Wan-AI/Wan2.2-I2V-A14B-Diffusers", subfolder="transformer_2", torch_dtype=base_dtype)
-        elif model == "Wan2.2-T2V-A14B-DF11":
-            dummy_transformer = WanTransformer3DModel.from_config("Wan-AI/Wan2.2-T2V-A14B-Diffusers", subfolder="transformer", torch_dtype=base_dtype)
-        else:
-            dummy_transformer = WanTransformer3DModel.from_config("Wan-AI/Wan2.2-T2V-A14B-Diffusers", subfolder="transformer_2", torch_dtype=base_dtype)
-        DFloat11Model.from_pretrained(model_path, device=transformer_load_device, bfloat16_model=dummy_transformer)
-        
-        transformer.load_state_dict(rename_diffusers_to_comfy(dummy_transformer.state_dict()), strict=True)
-        del dummy_transformer
+        DFloat11Model.from_pretrained(model_path, device=transformer_load_device, bfloat16_model=transformer)
+
         gc.collect()
         mm.soft_empty_cache()
 
