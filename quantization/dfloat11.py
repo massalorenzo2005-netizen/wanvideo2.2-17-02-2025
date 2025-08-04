@@ -163,6 +163,7 @@ def load_and_replace_tensors(model, directory_path, dfloat11_config, cpu_offload
     # Get all .safetensors files in the directory
     safetensors_files = [f for f in os.listdir(directory_path) if f.endswith('.safetensors')]
     loading_desc = 'Loading DFloat11 safetensors'
+    total_actual_loaded_tensors = []
 
     for file_name in tqdm(safetensors_files, desc=loading_desc):
         file_path = os.path.join(directory_path, file_name)
@@ -257,6 +258,11 @@ def load_and_replace_tensors(model, directory_path, dfloat11_config, cpu_offload
     
         if set(actual_loaded_tensors) != set(loaded_tensors.keys()):
             raise Exception(f"Some tensors are not loaded!\nLoaded keys:\n{set(loaded_tensors.keys())}\nActual loaded tensors: {set(actual_loaded_tensors)}\nNot loaded tensors: {set(loaded_tensors.keys()) - set(actual_loaded_tensors)}")
+        
+        total_actual_loaded_tensors.extend(actual_loaded_tensors)
+    
+    if set(total_actual_loaded_tensors) != set(model.state_dict().keys()):
+        raise Exception(f"Some tensors are not loaded!\nLoaded keys:\n{set(model.state_dict().keys())}\nActual loaded tensors: {set(total_actual_loaded_tensors)}\nNot loaded tensors: {set(model.state_dict().keys()) - set(total_actual_loaded_tensors)}")
     
     return model
 
