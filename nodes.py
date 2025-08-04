@@ -26,6 +26,7 @@ from comfy.utils import ProgressBar, common_upscale
 from comfy.clip_vision import clip_preprocess, ClipVisionModel
 from comfy.cli_args import args, LatentPreviewMethod
 import folder_paths
+import traceback
 
 script_directory = os.path.dirname(os.path.abspath(__file__))
 
@@ -2332,6 +2333,7 @@ class WanVideoSampler:
                         )
                 except Exception as e:
                     log.error(f"Error during model prediction: {e}")
+                    log.error(traceback.format_exc())
                     if force_offload:
                         if model["manual_offloading"]:
                             offload_transformer(transformer)
