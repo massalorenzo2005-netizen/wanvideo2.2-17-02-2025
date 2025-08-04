@@ -153,7 +153,7 @@ def load_and_replace_tensors(model, directory_path, dfloat11_config, cpu_offload
         
         # Load the tensors from the file
         loaded_tensors = load_file(file_path)
-        rename_diffusers_to_comfy(loaded_tensors) # -- the only change
+        loaded_tensors = rename_diffusers_to_comfy(loaded_tensors) # -- the only change
 
         # Iterate over each tensor in the file
         for tensor_name, tensor_value in loaded_tensors.items():
