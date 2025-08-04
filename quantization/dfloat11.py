@@ -1,8 +1,14 @@
+from ..utils import log
 import os
 import folder_paths
 from typing import Optional, Union, Dict
+import torch
 import torch.nn as nn
 from transformers import AutoConfig
+from tqdm import tqdm
+from safetensors.torch import load_file
+from dfloat11 import get_hook
+import re
 
 def rename_diffusers_to_comfy(state_dict):
     new_state_dict = {}
@@ -120,6 +126,115 @@ def locate_dfloat11(model):
 
 # ===
 
+# dfloat11 function, but with state dict renaming to comfy model layers
+def load_and_replace_tensors(model, directory_path, dfloat11_config, cpu_offload=False, pin_memory=False):
+    """
+    Loads DFloat11 compressed weights from safetensors files and configures the model
+    to use them with on-the-fly decompression.
+    
+    Args:
+        model: The PyTorch model to load weights into
+        directory_path: Path to the directory containing safetensors files
+        dfloat11_config: Configuration for DFloat11 compression
+        
+    Returns:
+        The model with configured DFloat11 compression
+    """
+    threads_per_block = dfloat11_config['threads_per_block']
+    bytes_per_thread  = dfloat11_config['bytes_per_thread']
+    pattern_dict      = dfloat11_config['pattern_dict']
+    
+    # Get all .safetensors files in the directory
+    safetensors_files = [f for f in os.listdir(directory_path) if f.endswith('.safetensors')]
+    loading_desc = 'Loading DFloat11 safetensors'
+
+    for file_name in tqdm(safetensors_files, desc=loading_desc):
+        file_path = os.path.join(directory_path, file_name)
+        
+        # Load the tensors from the file
+        loaded_tensors = load_file(file_path)
+        rename_diffusers_to_comfy(loaded_tensors) # -- the only change
+
+        # Iterate over each tensor in the file
+        for tensor_name, tensor_value in loaded_tensors.items():
+            # Check if this tensor exists in the model's state dict
+            if tensor_name in model.state_dict():
+                # Get the parameter or buffer
+                if tensor_name in dict(model.named_parameters()):
+                    # It's a parameter, we can set it directly
+                    param = dict(model.named_parameters())[tensor_name]
+                    if param.shape == tensor_value.shape:
+                        param.data.copy_(tensor_value)
+                    else:
+                        log.error(f"Shape mismatch for {tensor_name}: model {param.shape} vs loaded {tensor_value.shape}")
+                else:
+                    # It's a buffer, we can also set it directly
+                    buffer = dict(model.named_buffers())[tensor_name]
+                    if buffer.shape == tensor_value.shape:
+                        buffer.copy_(tensor_value)
+                    else:
+                        log.error(f"Shape mismatch for {tensor_name}: model {buffer.shape} vs loaded {tensor_value.shape}")
+            else:
+                # Split the tensor name to get module path
+                parts = tensor_name.split('.')
+                module = model
+                
+                # Navigate to the correct module
+                for i, part in enumerate(parts[:-1]):
+                    if hasattr(module, part):
+                        module = getattr(module, part)
+                    else:
+                        log.error(f"Cannot find module path for {tensor_name}")
+                        break
+                else:
+                    if parts[-1] == 'split_positions':
+                        setattr(module, 'split_positions', tensor_value.tolist())
+                    else:
+                        # Register the buffer to the found module
+                        module.register_buffer(parts[-1], tensor_value)
+
+                    # Set up decompression for encoded weights
+                    if parts[-1] == 'encoded_exponent':
+                        # Register the decode hook to decompress weights during forward pass
+                        module.register_forward_pre_hook(get_hook(threads_per_block, bytes_per_thread))
+
+                        # Configure weight injection based on module type
+                        for pattern, attr_names in pattern_dict.items():
+                            if re.fullmatch(pattern, '.'.join(parts[:-1])):
+                                if isinstance(module, nn.Embedding):
+                                    # Remove weight attribute from embedding layer
+                                    tmp = module.weight
+                                    delattr(module, 'weight')
+                                    del tmp
+                                elif isinstance(module, nn.Linear):
+                                    # Remove weight attribute from linear layer
+                                    tmp = module.weight
+                                    delattr(module, 'weight')
+                                    del tmp
+                                else:
+                                    # Handle special case for multi-module weight injection
+                                    setattr(module, 'weight_injection_modules', [])
+                                    for attr_path in attr_names:
+                                        parts = attr_path.split('.')
+                                        target = module
+                                        for p in parts:
+                                            target = getattr(target, p)
+
+                                        tmp = target.weight
+                                        delattr(target, 'weight')
+                                        del tmp
+                                        module.weight_injection_modules.append(target)
+                    elif parts[-1] == 'output_positions':
+                        # Calculate required shared memory size for CUDA kernel
+                        output_positions_np = tensor_value.view(torch.uint32).numpy()
+                        setattr(
+                            module,
+                            'shared_mem_size',
+                            threads_per_block[0] * 4 + 4 + (output_positions_np[1:] - output_positions_np[:-1]).max().item() * 2
+                        )
+    
+    return model
+
 class DFloat11Model:
     """
     Wrapper class for loading and using models with DFloat11 compressed weights.
@@ -133,7 +248,7 @@ class DFloat11Model:
         device: Optional[str] = None,
         bfloat16_model: Optional[nn.Module] = None,
         cpu_offload: bool = False,
-        pin_memory: bool = True,
+        pin_memory: bool = False,
         **kwargs,
     ):
         """
@@ -176,7 +291,7 @@ class DFloat11Model:
             for param in model.state_dict().values():
                 model_bytes += param.nbytes
 
-            print(f"Total model size: {model_bytes / 1e9:0.4f} GB", file=stderr)
+            log.info(f"Total model size: {model_bytes / 1e9:0.4f} GB")
 
         # Move model to specified device ~~or distribute across multiple devices~~
         # -- KJ wrapper will take care of it
