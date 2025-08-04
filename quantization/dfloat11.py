@@ -170,6 +170,7 @@ def load_and_replace_tensors(model, directory_path, dfloat11_config, cpu_offload
         # Load the tensors from the file
         loaded_tensors = load_file(file_path)
         loaded_tensors = rename_diffusers_to_comfy(loaded_tensors) # -- the only change
+        actual_loaded_tensors = []
 
         # Iterate over each tensor in the file
         for tensor_name, tensor_value in loaded_tensors.items():
@@ -180,6 +181,7 @@ def load_and_replace_tensors(model, directory_path, dfloat11_config, cpu_offload
                     # It's a parameter, we can set it directly
                     param = dict(model.named_parameters())[tensor_name]
                     if param.shape == tensor_value.shape:
+                        actual_loaded_tensors.append(tensor_name)
                         param.data.copy_(tensor_value)
                     else:
                         log.error(f"Shape mismatch for {tensor_name}: model {param.shape} vs loaded {tensor_value.shape}")
@@ -187,6 +189,7 @@ def load_and_replace_tensors(model, directory_path, dfloat11_config, cpu_offload
                     # It's a buffer, we can also set it directly
                     buffer = dict(model.named_buffers())[tensor_name]
                     if buffer.shape == tensor_value.shape:
+                        actual_loaded_tensors.append(tensor_name)
                         buffer.copy_(tensor_value)
                     else:
                         log.error(f"Shape mismatch for {tensor_name}: model {buffer.shape} vs loaded {tensor_value.shape}")
@@ -204,9 +207,11 @@ def load_and_replace_tensors(model, directory_path, dfloat11_config, cpu_offload
                         break
                 else:
                     if parts[-1] == 'split_positions':
+                        actual_loaded_tensors.append(tensor_name)
                         setattr(module, 'split_positions', tensor_value.tolist())
                     else:
                         # Register the buffer to the found module
+                        actual_loaded_tensors.append(tensor_name)
                         module.register_buffer(parts[-1], tensor_value)
 
                     # Set up decompression for encoded weights
@@ -242,12 +247,16 @@ def load_and_replace_tensors(model, directory_path, dfloat11_config, cpu_offload
                                         module.weight_injection_modules.append(target)
                     elif parts[-1] == 'output_positions':
                         # Calculate required shared memory size for CUDA kernel
+                        actual_loaded_tensors.append(tensor_name)
                         output_positions_np = tensor_value.view(torch.uint32).numpy()
                         setattr(
                             module,
                             'shared_mem_size',
                             threads_per_block[0] * 4 + 4 + (output_positions_np[1:] - output_positions_np[:-1]).max().item() * 2
                         )
+    
+        if set(actual_loaded_tensors) != set(loaded_tensors.keys()):
+            raise Exception(f"Some tensors are not loaded!\nLoaded keys:\n{set(loaded_tensors.keys())}\nActual loaded tensors: {set(actual_loaded_tensors)}\nNot loaded tensors: {set(loaded_tensors.keys()) - set(actual_loaded_tensors)}")
     
     return model
 
