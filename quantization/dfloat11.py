@@ -165,6 +165,7 @@ def load_and_replace_tensors(model, directory_path, dfloat11_config, cpu_offload
     safetensors_files = [f for f in os.listdir(directory_path) if f.endswith('.safetensors')]
     loading_desc = 'Loading DFloat11 safetensors'
     total_actual_loaded_tensors = []
+    total_actual_loaded_tensors_blacklist = []
 
     for file_name in tqdm(safetensors_files, desc=loading_desc):
         file_path = os.path.join(directory_path, file_name)
@@ -209,8 +210,9 @@ def load_and_replace_tensors(model, directory_path, dfloat11_config, cpu_offload
                         break
                 else:
                     if parts[-1] == 'split_positions':
-                        # actual_loaded_tensors.append(tensor_name)
+                        actual_loaded_tensors.append(tensor_name)
                         # Note: this assigns a list, so it won't be seen in state dict, resulting in extra keys otherwise
+                        total_actual_loaded_tensors_blacklist.append(tensor_name)
                         setattr(module, 'split_positions', tensor_value.tolist())
                     else:
                         # Register the buffer to the found module
@@ -258,16 +260,18 @@ def load_and_replace_tensors(model, directory_path, dfloat11_config, cpu_offload
                             threads_per_block[0] * 4 + 4 + (output_positions_np[1:] - output_positions_np[:-1]).max().item() * 2
                         )
     
-        if set(actual_loaded_tensors) != set(loaded_tensors.keys()):
-            raise Exception(f"Some tensors are not loaded!\nLoaded keys:\n{set(loaded_tensors.keys())}\nActual loaded tensors: {set(actual_loaded_tensors)}\nNot loaded tensors: {set(loaded_tensors.keys()) - set(actual_loaded_tensors)}")
+        actual_loaded_tensors = set(actual_loaded_tensors)
+        if  actual_loaded_tensors != set(loaded_tensors.keys()):
+            raise Exception(f"Some tensors are not loaded when loading a layer!\nNot loaded tensors: {set(loaded_tensors.keys()) - actual_loaded_tensors}\nExtra tensors: {actual_loaded_tensors - set(loaded_tensors.keys())}")
         
-        total_actual_loaded_tensors.extend(actual_loaded_tensors)
+        total_actual_loaded_tensors.extend(list(actual_loaded_tensors))
     
     model.expanded_patch_embedding = model.patch_embedding
     model.original_patch_embedding = model.patch_embedding
     total_actual_loaded_tensors.extend(["original_patch_embedding.weight", "original_patch_embedding.bias", "expanded_patch_embedding.weight", "expanded_patch_embedding.bias"])
-    if set(total_actual_loaded_tensors) != set(model.state_dict().keys()):
-        raise Exception(f"Some tensors are not loaded!\nNot loaded tensors: {set(model.state_dict().keys()) - set(total_actual_loaded_tensors)}\nExtra tensors: {set(total_actual_loaded_tensors)-set(model.state_dict().keys())}")
+    total_actual_loaded_tensors = set(total_actual_loaded_tensors) - set(total_actual_loaded_tensors_blacklist)
+    if total_actual_loaded_tensors != set(model.state_dict().keys()):
+        raise Exception(f"Some tensors are not loaded globally!\nNot loaded tensors: {set(model.state_dict().keys()) - total_actual_loaded_tensors}\nExtra tensors: {total_actual_loaded_tensors-set(model.state_dict().keys())}")
     
     return model
 
