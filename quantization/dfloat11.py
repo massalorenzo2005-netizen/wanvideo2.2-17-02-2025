@@ -7,7 +7,7 @@ import torch.nn as nn
 from transformers import AutoConfig
 from tqdm import tqdm
 from safetensors.torch import load_file
-from dfloat11 import get_hook
+from .dfloat11_core import get_hook
 import re
 
 def rename_diffusers_to_comfy(state_dict):
