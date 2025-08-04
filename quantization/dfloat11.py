@@ -209,7 +209,8 @@ def load_and_replace_tensors(model, directory_path, dfloat11_config, cpu_offload
                         break
                 else:
                     if parts[-1] == 'split_positions':
-                        actual_loaded_tensors.append(tensor_name)
+                        # actual_loaded_tensors.append(tensor_name)
+                        # Note: this assigns a list, so it won't be seen in state dict, resulting in extra keys otherwise
                         setattr(module, 'split_positions', tensor_value.tolist())
                     else:
                         # Register the buffer to the found module
