@@ -180,8 +180,6 @@ def load_and_replace_tensors(model, directory_path, dfloat11_config, cpu_offload
         # Iterate over each tensor in the file
         for tensor_name, tensor_value in loaded_tensors.items():
             # print(tensor_name, tensor_value.dtype)
-            if torch.is_floating_point(tensor_value):
-                tensor_value = tensor_value.to(torch.bfloat16)
             # Check if this tensor exists in the model's state dict
             if tensor_name in model.state_dict():
                 # Get the parameter or buffer
@@ -296,11 +294,16 @@ def load_and_replace_tensors(model, directory_path, dfloat11_config, cpu_offload
     if total_actual_loaded_tensors != set(model.state_dict().keys()):
         raise Exception(f"Some tensors are not loaded globally!\nNot loaded tensors: {set(model.state_dict().keys()) - total_actual_loaded_tensors}\nExtra tensors: {total_actual_loaded_tensors-set(model.state_dict().keys())}")
     
+    fp32_prec = "patch_embedding"
+    
     # Meta check
     meta_tensors = []
     for name, param in model.named_parameters():
         if param.is_meta:
             meta_tensors.append(name)
+        else:
+            if torch.is_floating_point(param.data) and fp32_prec not in name:
+                param.data = param.data.to(torch.bfloat16)
     if len(meta_tensors) > 0:
         raise Exception(f"Meta tensors found: {meta_tensors}")
     
