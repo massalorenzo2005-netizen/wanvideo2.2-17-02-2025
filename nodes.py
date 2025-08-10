@@ -2768,9 +2768,15 @@ class WanVideoSampler:
                         if vace_data is not None:
                             window_vace_data = []
                             for vace_entry in vace_data:
-                                partial_context = vace_entry["context"][0][:, c]
+                                vace_tensor = vace_entry["context"][0]
+                                vace_len = vace_tensor.shape[1]
+
+                                safe_c = [min(idx, vace_len - 1) for idx in c]
+
+                                partial_context = vace_tensor[:, safe_c]
+
                                 if has_ref:
-                                    partial_context[:, 0] = vace_entry["context"][0][:, 0]
+                                    partial_context[:, 0] = vace_tensor[:, 0]
                                 
                                 window_vace_data.append({
                                     "context": [partial_context], 
@@ -2778,7 +2784,7 @@ class WanVideoSampler:
                                     "start": vace_entry["start"], 
                                     "end": vace_entry["end"],
                                     "seq_len": vace_entry["seq_len"]
-                                })
+                                }) 
                             
                             partial_vace_context = window_vace_data
 
