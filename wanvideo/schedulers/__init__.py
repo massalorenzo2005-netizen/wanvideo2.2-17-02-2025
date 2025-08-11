@@ -22,7 +22,6 @@ scheduler_list = [
     "flowmatch_causvid",
     "flowmatch_distill",
     "flowmatch_pusa",
-    "lighting_euler_distill", "lighting_euler_distill/beta",
     "lighting_euler", "lighting_euler/beta", "lighting_euler/beta57",
     "multitalk"
 ]
@@ -107,20 +106,6 @@ def get_scheduler(scheduler, steps, shift, device, transformer_dim, flowedit_arg
             shift=shift, sigma_min=0.0, extra_one_step=True
         )
         sample_scheduler.set_timesteps(steps, denoising_strength=denoise_strength, shift=shift, sigmas=sigmas[:-1].tolist() if sigmas is not None else None)
-    elif 'lighting_euler_distill' in scheduler:
-        if sigmas is not None:
-            raise NotImplementedError("This scheduler does not support custom sigmas")
-        sample_scheduler = FlowMatchEulerDiscreteScheduler(shift=shift, use_beta_sigmas=(scheduler == 'euler/beta'))
-
-        denoising_step_list = torch.tensor([1000.0000, 937.5001, 833.3333, 625.0000], dtype=torch.float32)
-
-        log.info(f"denoising_step_list: {denoising_step_list}")
-
-        if steps != 4:
-            raise ValueError("This scheduler is only for 4 steps")
-
-        sample_scheduler.timesteps = denoising_step_list[:steps].clone().detach().to(device)
-        sample_scheduler.sigmas = torch.cat([sample_scheduler.timesteps / 1000, torch.tensor([0.0], device=device)])
     elif 'lighting_euler' in scheduler:
         if sigmas is not None:
             raise NotImplementedError("This scheduler does not support custom sigmas")
