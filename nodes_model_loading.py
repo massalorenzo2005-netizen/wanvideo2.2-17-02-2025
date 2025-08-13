@@ -4,7 +4,7 @@ from .utils import log, apply_lora
 import numpy as np
 from tqdm import tqdm
 
-from .wanvideo.modules.model import WanModel
+from .wanvideo.modules.model import WanModel, LoRALinearLayer
 from .wanvideo.modules.t5 import T5EncoderModel
 from .wanvideo.modules.clip import CLIPModel
 from .wanvideo.wan_video_vae import WanVideoVAE, WanVideoVAE38
@@ -1140,7 +1140,20 @@ class WanVideoModelLoader:
                     transformer.patch_embedding = new_in
                     transformer.expanded_patch_embedding = new_in
 
-                patcher, _ = load_lora_for_models(patcher, None, lora_sd, lora_strength, 0)
+                if "diffusion_model.blocks.0.self_attn.q_loras.down.weight" in lora_sd:                        
+                    log.info("Stand-In LoRA detected")
+                    for block in transformer.blocks:
+                        block.self_attn.q_loras = LoRALinearLayer(dim, dim, rank=128, device=transformer_load_device, dtype=base_dtype, strength=lora_strength)
+                        block.self_attn.k_loras = LoRALinearLayer(dim, dim, rank=128, device=transformer_load_device, dtype=base_dtype, strength=lora_strength)
+                        block.self_attn.v_loras = LoRALinearLayer(dim, dim, rank=128, device=transformer_load_device, dtype=base_dtype, strength=lora_strength)
+                        for lora in [block.self_attn.q_loras, block.self_attn.k_loras, block.self_attn.v_loras]:
+                            for param in lora.parameters():
+                                param.requires_grad = False
+                    for name, param in transformer.named_parameters():
+                        if "lora" in name:
+                            param.data.copy_(lora_sd["diffusion_model." + name].to(param.device, dtype=param.dtype))
+                else:
+                    patcher, _ = load_lora_for_models(patcher, None, lora_sd, lora_strength, 0)
                 
                 del lora_sd
             
@@ -1168,6 +1181,8 @@ class WanVideoModelLoader:
                     desc=f"Loading transformer parameters to {transformer_load_device}", 
                     total=param_count,
                     leave=True):
+                if "loras" in name:
+                    continue
                 #print(name, param.dtype, param.device, param.shape)
                 if isinstance(param, GGUFParameter):
                     dtype_to_use = torch.uint8
