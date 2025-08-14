@@ -19,17 +19,18 @@ except:
 
 from .attention import attention
 import numpy as np
-__all__ = ['WanModel']
 
 from tqdm import tqdm
 import gc
-from comfy import model_management as mm
+
 from ...utils import log, get_module_memory_mb
 from ...cache_methods.cache_methods import TeaCacheState, MagCacheState, EasyCacheState, relative_l1_distance
 from ...multitalk.multitalk import get_attn_map_with_target
 from ...echoshot.echoshot import rope_apply_z, rope_apply_c, rope_apply_echoshot
 
-from comfy.model_management import get_torch_device, get_autocast_device, get_offload_stream
+__all__ = ['WanModel']
+
+from comfy import model_management as mm
 from comfy.ldm.flux.math import apply_rope as apply_rope_comfy
 
 def apply_rope_comfy_chunked(xq, xk, freqs_cis, num_chunks=4):
@@ -156,7 +157,7 @@ def rope_params(max_seq_len, dim, theta=10000, L_test=25, k=0):
     freqs = torch.polar(torch.ones_like(freqs), freqs)
     return freqs
 
-@torch.autocast(device_type=get_autocast_device(get_torch_device()), enabled=False)
+@torch.autocast(device_type=mm.get_autocast_device(mm.get_torch_device()), enabled=False)
 @torch.compiler.disable()
 def rope_apply(x, grid_sizes, freqs):
     n, c = x.size(2), x.size(3) // 2
@@ -644,6 +645,8 @@ class WanAttentionBlock(nn.Module):
         self.dense_block = False
         self.dense_attention_mode = "sageattn"
 
+        self.kv_cache = None
+
         # layers
         self.norm1 = WanLayerNorm(out_features, eps)
         self.self_attn = WanSelfAttention(in_features, out_features, num_heads, qk_norm,
@@ -739,11 +742,12 @@ class WanAttentionBlock(nn.Module):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.get_mod(e.to(x.device))
         input_x = self.modulate(self.norm1(x), shift_msa, scale_msa)
 
-        if e_ip is not None:
+        if x_ip is not None:
             shift_msa_ip, scale_msa_ip, gate_msa_ip, shift_mlp_ip, scale_mlp_ip, gate_mlp_ip = self.get_mod(e_ip.to(x.device))
             input_x_ip = self.modulate(self.norm1(x_ip), shift_msa_ip, scale_msa_ip)
             self.self_attn.cond_size = input_x_ip.shape[1]
             input_x = torch.concat([input_x, input_x_ip], dim=1)
+            self.kv_cache = None
 
         if camera_embed is not None:
             # encode ReCamMaster camera
@@ -765,7 +769,8 @@ class WanAttentionBlock(nn.Module):
             q, k, v = self.self_attn.qkv_fn(input_x)
             q=rope_apply_echoshot(q, grid_sizes, freqs, inner_t).to(q)
             k=rope_apply_echoshot(k, grid_sizes, freqs, inner_t).to(k)
-        elif x_ip is not None:
+        elif x_ip is not None and self.kv_cache is None:
+            # First pass - separate main and IP components
             x_main, x_ip_input = input_x[:, : -self.self_attn.cond_size], input_x[:, -self.self_attn.cond_size :]
             # Compute QKV for main content
             q, k, v = self.self_attn.qkv_fn(x_main)
@@ -820,8 +825,17 @@ class WanAttentionBlock(nn.Module):
                 y = self.self_attn.forward(q, k, v, seq_lens, attention_mode_override="sageattn_3")
             else:
                 y = self.self_attn.forward(q, k, v, seq_lens, attention_mode_override="sageattn")
-        elif x_ip is not None:
+        elif x_ip is not None and self.kv_cache is None:
+            # First pass: cache IP keys/values and compute attention
+            self.kv_cache = {"k_ip": k_ip.detach(), "v_ip": v_ip.detach()}
             y = self.self_attn.forward_ip(q, k, v, q_ip, k_ip, v_ip, seq_lens)
+        elif self.kv_cache is not None:
+            # Subsequent passes: use cached IP keys/values
+            k_ip = self.kv_cache["k_ip"]
+            v_ip = self.kv_cache["v_ip"]
+            full_k = torch.cat([k, k_ip], dim=1)
+            full_v = torch.cat([v, v_ip], dim=1)
+            y = self.self_attn.forward(q, full_k, full_v, seq_lens)
         else:
             y = self.self_attn.forward(q, k, v, seq_lens)
 
@@ -862,9 +876,8 @@ class WanAttentionBlock(nn.Module):
             x_ip = x_ip.addcmul(y_ip, gate_msa_ip)
             y_ip = self.ffn(torch.addcmul(shift_mlp_ip, self.norm2(x_ip), 1 + scale_mlp_ip))
             x_ip = x_ip.addcmul(y_ip, gate_mlp_ip)
-            return x, x_ip
-        
-        return x
+
+        return x, x_ip
 
     
     def cross_attn_ffn(self, x, context, grid_sizes, shift_mlp, scale_mlp, gate_mlp, clip_embed, 
@@ -986,14 +999,14 @@ class BaseWanAttentionBlock(WanAttentionBlock):
         self.block_id = block_id
 
     def forward(self, x, vace_hints=None, vace_context_scale=[1.0], **kwargs):
-        x = super().forward(x, **kwargs)
+        x, x_ip = super().forward(x, **kwargs)
         if vace_hints is None:
-            return x
+            return x, x_ip
         
         if self.block_id is not None:
             for i in range(len(vace_hints)):
                 x.add_(vace_hints[i][self.block_id].to(x.device), alpha=vace_context_scale[i])
-        return x
+        return x, x_ip
 
 class Head(nn.Module):
 
@@ -1405,7 +1418,7 @@ class WanModel(torch.nn.Module):
             else:
                 c_processed = current_c
                 
-            c_processed = block.forward(c_processed, **kwargs)
+            c_processed, _ = block.forward(c_processed, **kwargs)
             
             # Store skip connection
             c_skip = block.after_proj(c_processed)
@@ -1479,6 +1492,9 @@ class WanModel(torch.nn.Module):
             List[Tensor]:
                 List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
         """
+        if is_uncond or current_step > 0:
+            standin_input = None
+
         if self.lora_scheduling_enabled:
             for name, submodule in self.named_modules():
                 if isinstance(submodule, nn.Linear):
@@ -1963,10 +1979,7 @@ class WanModel(torch.nn.Module):
                     if b in self.slg_blocks and is_uncond:
                         if self.slg_start_percent <= current_step_percentage <= self.slg_end_percent:
                             continue
-                if x_ip is None:
-                    x = block(x,**kwargs)
-                else:
-                    x, x_ip = block(x, x_ip=x_ip, **kwargs)
+                x, x_ip = block(x, x_ip=x_ip, **kwargs)
                 if self.block_swap_debug:
                     compute_end = time.perf_counter()
                     compute_time = compute_end - compute_start

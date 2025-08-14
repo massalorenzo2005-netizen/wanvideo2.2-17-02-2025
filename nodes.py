@@ -36,6 +36,8 @@ VAE_STRIDE = (4, 8, 8)
 PATCH_SIZE = (1, 2, 2)
 
 def offload_transformer(transformer):
+    for block in transformer.blocks:
+        block.kv_cache = None
     transformer.teacache_state.clear_all()
     transformer.magcache_state.clear_all()
     transformer.easycache_state.clear_all()
@@ -827,6 +829,9 @@ class WanVideoImageToVideoEncode:
         
         num_frames = ((num_frames - 1) // 4) * 4 + 1
         two_ref_images = start_image is not None and end_image is not None
+
+        if start_image is None and end_image is not None:
+            fun_or_fl2v_model = True # end image alone only works with this option
 
         base_frames = num_frames + (1 if two_ref_images and not fun_or_fl2v_model else 0)
         if temporal_mask is None:
@@ -1696,18 +1701,20 @@ class WanVideoSampler:
 
             control_embeds = image_embeds.get("control_embeds", None)
             if control_embeds is not None:
-                if transformer.in_dim not in [52, 48, 32]:
+                if transformer.in_dim not in [52, 48, 36, 32]:
                     raise ValueError("Control signal only works with Fun-Control model")
-                if transformer.in_dim == 52: #fun 2.2 control
+                if transformer.in_dim == 52 or transformer.control_adapter is not None: #fun 2.2 control
                     image_cond_mask = image_embeds.get("mask", None)
                     if image_cond_mask is not None:
                         image_cond = torch.cat([image_cond_mask, image_cond])
                 control_latents = control_embeds.get("control_images", None)
-                control_camera_latents = control_embeds.get("control_camera_latents", None)
-                control_camera_start_percent = control_embeds.get("control_camera_start_percent", 0.0)
-                control_camera_end_percent = control_embeds.get("control_camera_end_percent", 1.0)
                 control_start_percent = control_embeds.get("start_percent", 0.0)
                 control_end_percent = control_embeds.get("end_percent", 1.0)
+                if transformer.control_adapter is not None:
+                    control_camera_latents = control_embeds.get("control_camera_latents", None)
+                    control_camera_start_percent = control_embeds.get("control_camera_start_percent", 0.0)
+                    control_camera_end_percent = control_embeds.get("control_camera_end_percent", 1.0)
+                
             drop_last = image_embeds.get("drop_last", False)
             has_ref = image_embeds.get("has_ref", False)
         else: #t2v
@@ -1774,11 +1781,12 @@ class WanVideoSampler:
                 control_latents = control_embeds.get("control_images", None)
                 if control_latents is not None:
                     control_latents = control_latents.to(device)
-                control_camera_latents = control_embeds.get("control_camera_latents", None)
-                control_camera_start_percent = control_embeds.get("control_camera_start_percent", 0.0)
-                control_camera_end_percent = control_embeds.get("control_camera_end_percent", 1.0)
-                if control_camera_latents is not None:
-                    control_camera_latents = control_camera_latents.to(device)
+                if transformer.control_adapter is not None:
+                    control_camera_latents = control_embeds.get("control_camera_latents", None)
+                    control_camera_start_percent = control_embeds.get("control_camera_start_percent", 0.0)
+                    control_camera_end_percent = control_embeds.get("control_camera_end_percent", 1.0)
+                    if control_camera_latents is not None:
+                        control_camera_latents = control_camera_latents.to(device)
 
                 if control_lora:
                     image_cond = control_latents.to(device)
@@ -1787,10 +1795,10 @@ class WanVideoSampler:
                         patcher = apply_lora(patcher, device, device, low_mem_load=False, control_lora=True)
                         patcher.model.is_patched = True
                 else:
-                    if transformer.in_dim not in [48, 32, 52]:
+                    if transformer.in_dim not in [48, 36, 32, 52]:
                         raise ValueError("Control signal only works with Fun-Control model")
                     image_cond = torch.zeros_like(noise).to(device) #fun control
-                    if transformer.in_dim == 52: #fun 2.2 control
+                    if transformer.in_dim == 52 or transformer.control_adapter is not None: #fun 2.2 control
                         mask_latents = torch.tile(
                             torch.zeros_like(noise[:1]), [4, 1, 1, 1]
                         )
