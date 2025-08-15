@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 import os, gc, uuid
 from .utils import log, apply_lora
 import numpy as np
@@ -424,7 +425,7 @@ class WanVideoLoraSelect:
         lora = {
             "path": lora_path,
             "strength": strength,
-            "name": lora.split(".")[0],
+            "name": os.path.splitext(lora)[0],
             "blocks": blocks.get("selected_blocks", {}),
             "layer_filter": blocks.get("layer_filter", ""),
             "low_mem_load": low_mem_load,
@@ -489,7 +490,7 @@ class WanVideoLoraSelectMulti:
             loras_list.append({
                 "path": folder_paths.get_full_path("loras", lora_name),
                 "strength": s,
-                "name": lora_name.split(".")[0],
+                "name": os.path.splitext(lora_name)[0],
                 "blocks": blocks.get("selected_blocks", {}),
                 "layer_filter": blocks.get("layer_filter", ""),
                 "low_mem_load": low_mem_load,
@@ -736,6 +737,7 @@ class WanVideoModelLoader:
                 "vace_model": ("VACEPATH", {"default": None, "tooltip": "VACE model to use when not using model that has it included"}),
                 "fantasytalking_model": ("FANTASYTALKINGMODEL", {"default": None, "tooltip": "FantasyTalking model https://github.com/Fantasy-AMAP"}),
                 "multitalk_model": ("MULTITALKMODEL", {"default": None, "tooltip": "Multitalk model"}),
+                "fantasyportrait_model": ("FANTASYPORTRAITMODEL", {"default": None, "tooltip": "FantasyPortrait model"}),
             }
         }
 
@@ -745,9 +747,10 @@ class WanVideoModelLoader:
     CATEGORY = "WanVideoWrapper"
 
     def loadmodel(self, model, base_precision, load_device,  quantization,
-                  compile_args=None, attention_mode="sdpa", block_swap_args=None, lora=None, vram_management_args=None, vace_model=None, fantasytalking_model=None, multitalk_model=None):
+                  compile_args=None, attention_mode="sdpa", block_swap_args=None, lora=None, vram_management_args=None, vace_model=None, 
+                  fantasytalking_model=None, multitalk_model=None, fantasyportrait_model=None):
         assert not (vram_management_args is not None and block_swap_args is not None), "Can't use both block_swap_args and vram_management_args at the same time"
-        
+
         lora_low_mem_load = merge_loras = False
         if lora is not None:
             for l in lora:
@@ -814,6 +817,13 @@ class WanVideoModelLoader:
                         if "scaled_fp8" in sd:
                             quantization = "fp8_e5m2_scaled"
                         break
+        
+        if torch.cuda.is_available():
+            #only warning for now
+            major, minor = torch.cuda.get_device_capability(device)
+            log.info(f"CUDA Compute Capability: {major}.{minor}")
+            if compile_args is not None and "e4" in quantization and (major, minor) < (8, 9):
+                log.warning("Torch.compile with fp8_e4m3fn weights on CUDA compute capability < 8.9 is not supported. Please use fp8_e5m2, GGUF or higher precision instead.")
 
         if "scaled_fp8" in sd and "scaled" not in quantization:
             raise ValueError("The model is a scaled fp8 model, please set quantization to '_scaled'")
@@ -892,7 +902,7 @@ class WanVideoModelLoader:
                 vace_layers = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28]
             vace_in_dim = 96
 
-        log.info(f"Model type: {model_type}, num_heads: {num_heads}, num_layers: {num_layers}")
+        log.info(f"Model cross attention type: {model_type}, num_heads: {num_heads}, num_layers: {num_layers}")
 
         teacache_coefficients_map = {
             "1_3B": {
@@ -970,7 +980,6 @@ class WanVideoModelLoader:
         #ReCamMaster
         if "blocks.0.cam_encoder.weight" in sd:
             log.info("ReCamMaster model detected, patching model...")
-            import torch.nn as nn
             for block in transformer.blocks:
                 block.cam_encoder = nn.Linear(12, dim)
                 block.projector = nn.Linear(dim, dim)
@@ -983,11 +992,25 @@ class WanVideoModelLoader:
         if fantasytalking_model is not None:
             log.info("FantasyTalking model detected, patching model...")
             context_dim = fantasytalking_model["sd"]["proj_model.proj.weight"].shape[0]
-            import torch.nn as nn
             for block in transformer.blocks:
                 block.cross_attn.k_proj = nn.Linear(context_dim, dim, bias=False)
                 block.cross_attn.v_proj = nn.Linear(context_dim, dim, bias=False)
             sd.update(fantasytalking_model["sd"])
+
+        # FantasyPortrait https://github.com/Fantasy-AMAP/fantasy-portrait/
+        if fantasyportrait_model is not None:
+            log.info("FantasyPortrait model detected, patching model...")
+            context_dim = fantasyportrait_model["sd"]["ip_adapter.blocks.0.cross_attn.ip_adapter_single_stream_k_proj.weight"].shape[1]
+
+            for block in transformer.blocks:
+                block.cross_attn.ip_adapter_single_stream_k_proj = nn.Linear(context_dim, dim, bias=False)
+                block.cross_attn.ip_adapter_single_stream_v_proj = nn.Linear(context_dim, dim, bias=False)
+            ip_adapter_sd = {}
+            for k, v in fantasyportrait_model["sd"].items():
+                if k.startswith("ip_adapter."):
+                    ip_adapter_sd[k.replace("ip_adapter.", "")] = v
+            sd.update(ip_adapter_sd)
+
         if multitalk_model is not None:
             # init audio module
             from .multitalk.multitalk import SingleStreamMultiAttention
@@ -1048,7 +1071,7 @@ class WanVideoModelLoader:
                 dtype = torch.float8_e5m2
             else:
                 dtype = base_dtype
-            params_to_keep = {"norm", "bias", "time_in", "patch_embedding", "time_", "img_emb", "modulation", "text_embedding", "adapter", "add"}
+            params_to_keep = {"norm", "bias", "time_in", "patch_embedding", "time_", "img_emb", "modulation", "text_embedding", "adapter", "add", "ref_conv"}
             if not lora_low_mem_load:
                 log.info("Using accelerate to load and assign model weights to device...")
                 param_count = sum(1 for _ in transformer.named_parameters())
@@ -1286,7 +1309,6 @@ class WanVideoModelLoader:
         for model in mm.current_loaded_models:
             if model._model() == patcher:
                 mm.current_loaded_models.remove(model)
-
         return (patcher,)
     
 # class WanVideoSaveModel:
