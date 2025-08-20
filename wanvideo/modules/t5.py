@@ -10,6 +10,8 @@ from comfy.utils import ProgressBar
 
 from .tokenizers import HuggingfaceTokenizer
 
+from ...utils import log
+
 __all__ = [
     'T5Model',
     'T5Encoder',
@@ -510,5 +512,6 @@ class T5EncoderModel:
         ids = ids.to(device)
         mask = mask.to(device)
         seq_lens = mask.gt(0).sum(dim=1).long()
+        log.info(f"T5 Tokens: {seq_lens.sum().item()}")
         context = self.model(ids, mask)
         return [u[:v] for u, v in zip(context, seq_lens)]
