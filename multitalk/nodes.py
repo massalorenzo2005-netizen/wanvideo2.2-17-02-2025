@@ -52,7 +52,8 @@ class MultiTalkModelLoader:
         multitalk = {
             "proj_model": multitalk_proj_model,
             "sd": sd,
-            "is_gguf": model_path.endswith(".gguf")
+            "is_gguf": model_path.endswith(".gguf"),
+            "model_type": "InfiniteTalk" if "infinite" in model.lower() else "MultiTalk",
         }
 
         return (multitalk,)
@@ -90,8 +91,8 @@ class MultiTalkWav2VecEmbeds:
             }
         }
 
-    RETURN_TYPES = ("MULTITALK_EMBEDS", "AUDIO", )
-    RETURN_NAMES = ("multitalk_embeds", "audio", )
+    RETURN_TYPES = ("MULTITALK_EMBEDS", "AUDIO", "INT", )
+    RETURN_NAMES = ("multitalk_embeds", "audio", "num_frames", )
     FUNCTION = "process"
     CATEGORY = "WanVideoWrapper"
 
@@ -230,12 +231,30 @@ class MultiTalkWav2VecEmbeds:
                     offset += w.shape[-1]
                 out_audio = {"waveform": mixed, "sample_rate": sr}
 
+        # Calculate actual frames based on audio duration
+        actual_num_frames = num_frames
+        if len(audio_outputs) > 0:
+            if multi_audio_type == "para":
+                # For parallel mode, use the longest audio duration
+                max_audio_duration = max([ao["waveform"].shape[-1] / sr for ao in audio_outputs])
+                actual_frames_from_audio = int(max_audio_duration * fps)
+            else:  # "add"
+                # For sequential mode, use the total audio duration
+                total_audio_duration = sum([ao["waveform"].shape[-1] / sr for ao in audio_outputs])
+                actual_frames_from_audio = int(total_audio_duration * fps)
+            
+            # Use the smaller of requested frames or actual audio frames
+            actual_num_frames = min(num_frames, actual_frames_from_audio)
+            
+            if actual_frames_from_audio < num_frames:
+                log.info(f"[MultiTalk] Audio duration ({actual_frames_from_audio} frames) is shorter than requested ({num_frames} frames). Using {actual_num_frames} frames.")
+
         # Debug: log final mixed audio length and mode
         total_samples_raw = sum([ao["waveform"].shape[-1] for ao in audio_outputs])
         log.info(f"[MultiTalk] total raw duration = {total_samples_raw/sr:.3f}s")
         log.info(f"[MultiTalk] multi_audio_type={multi_audio_type} | final waveform shape={out_audio['waveform'].shape} | length={out_audio['waveform'].shape[-1]} samples | seconds={out_audio['waveform'].shape[-1]/sr:.3f}s (expected {'sum' if multi_audio_type=='add' else 'max'} of raw)")
 
-        return (multitalk_embeds, out_audio)
+        return (multitalk_embeds, out_audio, actual_num_frames)
 
 
 class WanVideoImageToVideoMultiTalk:
@@ -266,9 +285,10 @@ class WanVideoImageToVideoMultiTalk:
                 "tiled_vae": ("BOOLEAN", {"default": False, "tooltip": "Use tiled VAE encoding for reduced memory use"}),
                 "clip_embeds": ("WANVIDIMAGE_CLIPEMBEDS", {"tooltip": "Clip vision encoded image"}),
                 "mode": ([
+                    "auto",
                     "multitalk",
                     "infinitetalk"
-                ], {"default": "multitalk", "tooltip": "The sampling strategy to use in the long video generation loop, should match the model used"})
+                ], {"default": "auto", "tooltip": "The sampling strategy to use in the long video generation loop, should match the model used"})
             }
         }
 
@@ -321,7 +341,7 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "MultiTalkModelLoader": "MultiTalk Model Loader",
-    "MultiTalkWav2VecEmbeds": "MultiTalk Wav2Vec Embeds",
-    "WanVideoImageToVideoMultiTalk": "WanVideo Image To Video MultiTalk"
+    "MultiTalkModelLoader": "Multi/InfiniteTalk Model Loader",
+    "MultiTalkWav2VecEmbeds": "Multi/InfiniteTalk Wav2Vec Embeds",
+    "WanVideoImageToVideoMultiTalk": "WanVideo Long I2V Multi/InfiniteTalk"
 }
