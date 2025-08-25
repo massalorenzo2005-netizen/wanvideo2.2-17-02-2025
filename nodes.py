@@ -19,6 +19,8 @@ from .cache_methods.cache_methods import cache_report
 from .enhance_a_video.globals import set_enhance_weight, set_num_frames
 from .taehv import TAEHV
 
+from .CFGSkimming.skimming_utils import SkimmingUtils
+
 from einops import rearrange
 
 from comfy import model_management as mm
@@ -1495,6 +1497,9 @@ class WanVideoExperimentalArgs:
                 "raag_alpha": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 10.0, "step": 0.01, "tooltip": "Alpha value for RAAG, 1.0 is default, 0.0 is disabled."}),
                 "bidirectional_sampling": ("BOOLEAN", {"default": False, "tooltip": "Enable bidirectional sampling, based on https://github.com/ff2416/WanFM"})
             },
+            "optional": {
+                "skimming_args": ("SKIMMING_ARGS",)
+            }
         }
 
     RETURN_TYPES = ("EXPERIMENTALARGS", )
@@ -1505,7 +1510,55 @@ class WanVideoExperimentalArgs:
     EXPERIMENTAL = True
 
     def process(self, **kwargs):
+        if "skimming_args" in kwargs:
+            kwargs.update(kwargs["skimming_args"])
         return (kwargs,)
+    
+class SkimmingCFGArgs:
+    EXPERIMENTAL = True
+    DESCRIPTION = "CFG skimming parameters for WanVideoWrapper (BETA)"
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "use_skimming": ("BOOLEAN", {"default": False, "tooltip": "Enable CFG skimming to reduce artifacts in video generation. Applies to all modes: 'replace' (enables mask-based replacement), 'linear_interp' (enables linear interpolation), 'dual_scales' (enables dual-scale adjustment), and 'difference' (enables difference-based scaling)."}),
+                "skimming_type": (["replace", "linear_interp", "dual_scales", "difference"], {"default": "replace", "tooltip": "Type of CFG skimming method. 'replace' uses mask-based substitution, 'linear_interp' applies linear interpolation, 'dual_scales' adjusts positive and negative conditioning separately, 'difference' scales based on difference metrics."}),
+                "flip_at_percentage": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Relative to step progression. Lower values give smoother results, higher values give noisier results. Affects 'replace' by flipping filter behavior, 'linear_interp' by adjusting interpolation strength, 'dual_scales' by balancing scales, and 'difference' by modulating difference scaling."}),
+                "start_at_percentage": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Start applying skimming at this percentage of sampling steps. Applies uniformly to 'replace' (mask activation), 'linear_interp' (interpolation start), 'dual_scales' (dual-scale start), and 'difference' (difference scaling start)."}),
+                "end_at_percentage": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Stop applying skimming at this percentage of sampling steps. Applies uniformly to 'replace' (mask deactivation), 'linear_interp' (interpolation end), 'dual_scales' (dual-scale end), and 'difference' (difference scaling end, with < condition)."}),
+                "disable_flipping_filter": ("BOOLEAN", {"default": False, "tooltip": "Disable filter preventing sign flipping in skimming. In 'replace', disables sign correction in mask application; in 'linear_interp', allows sign changes in interpolation; in 'dual_scales', affects both positive and negative scaling; in 'difference', modifies difference scaling behavior."}),
+                "full_skim_negative": ("BOOLEAN", {"default": True, "tooltip": "Use zero CFG for negative conditioning in 'replace' mode only. Ignored in 'linear_interp', 'dual_scales', and 'difference'."}),
+                "Skimming_CFG": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 10.0, "step": 0.5, "tooltip": "Universal CFG scale. In 'linear_interp', sets interpolation strength; in 'dual_scales', sets positive conditioning scale; in 'difference', acts as reference scale for difference adjustment. Higher values increase effect."}),
+                "Skimming_CFG_Dual": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 10.0, "step": 0.5, "tooltip": "CFG scale for negative conditioning in 'dual_scales' mode only. Ignored in 'replace', 'linear_interp', and 'difference'. Higher values adjust negative influence."}),
+                "method": (["linear_distance", "squared_distance", "root_distance", "absolute_sum"], {"default": "linear_distance", "tooltip": "Distance method for 'difference' mode only. 'linear_distance' uses absolute difference, 'squared_distance' squares it, 'root_distance' takes square root, 'absolute_sum' sums absolute values. Ignored in other modes."}),
+            }
+        }
+
+    RETURN_TYPES = ("SKIMMING_ARGS",)
+    FUNCTION = "get_args"
+    CATEGORY = "model_patches/Pre CFG"
+
+    def get_args(self, use_skimming, skimming_type, flip_at_percentage, start_at_percentage, end_at_percentage, disable_flipping_filter, full_skim_negative, Skimming_CFG, Skimming_CFG_Dual, method):
+        return {
+            "use_skimming": use_skimming,
+            "skimming_type": skimming_type,
+            "flip_at_percentage": flip_at_percentage,
+            "start_at_percentage": start_at_percentage,
+            "end_at_percentage": end_at_percentage,
+            "disable_flipping_filter": disable_flipping_filter,
+            "full_skim_negative": full_skim_negative,
+            "Skimming_CFG": Skimming_CFG,
+            "Skimming_CFG_Dual": Skimming_CFG_Dual,
+            "method": method
+        }
+
+    RETURN_TYPES = ("SKIMMING_ARGS",)
+    RETURN_NAMES = ("skimming_args",)
+    FUNCTION = "process"
+    CATEGORY = "WanVideoWrapper"
+
+    def process(self, **kwargs):
+        return (kwargs,)        
     
 class WanVideoFreeInitArgs:
     @classmethod
@@ -2276,7 +2329,7 @@ class WanVideoSampler:
                 timesteps[-drift_steps:] = drift_timesteps[-drift_steps:]
 
         # Experimental args
-        use_cfg_zero_star = use_tangential = use_fresca = bidirectional_sampling =False
+        use_cfg_zero_star = use_tangential = use_fresca = bidirectional_sampling = use_cfg_skimming = False
         raag_alpha = 0.0
         if experimental_args is not None:
             video_attention_split_steps = experimental_args.get("video_attention_split_steps", [])
@@ -2301,6 +2354,21 @@ class WanVideoSampler:
             if bidirectional_sampling:
                 import copy
                 sample_scheduler_flipped = copy.deepcopy(sample_scheduler)
+
+            skimming_args = experimental_args.get("skimming_args", {})
+            use_cfg_skimming = skimming_args.get("use_skimming", False)
+            if use_cfg_skimming:
+                skimming_type = skimming_args.get("skimming_type", "replace")
+                flip_at_percentage = skimming_args.get("flip_at_percentage", 0.3)
+                start_at_percentage = skimming_args.get("start_at_percentage", 0.0)
+                end_at_percentage = skimming_args.get("end_at_percentage", 1.0)
+                disable_flipping_filter = skimming_args.get("disable_flipping_filter", False)
+                full_skim_negative = skimming_args.get("full_skim_negative", True)
+                Skimming_CFG = skimming_args.get("Skimming_CFG", 5.0)
+                Skimming_CFG_positive = skimming_args.get("Skimming_CFG_positive", 5.0)
+                Skimming_CFG_negative = skimming_args.get("Skimming_CFG_negative", 5.0)
+                reference_CFG = skimming_args.get("reference_CFG", 5.0)
+                method = skimming_args.get("method", "linear_distance")
 
         #rope
         ntk_alphas = [1.0, 1.0, 1.0]
@@ -2551,6 +2619,37 @@ class WanVideoSampler:
                             **base_params
                         )
                         noise_pred_uncond = noise_pred_uncond[0].to(intermediate_device)
+
+                        if use_cfg_skimming:
+                            current_percent = current_step_percentage
+                            sigma = SkimmingUtils.percent_to_sigma(current_percent)
+                            flip_at_sigma = SkimmingUtils.percent_to_sigma(flip_at_percentage)
+                            effective_disable = disable_flipping_filter if sigma > flip_at_sigma else not disable_flipping_filter
+                            if current_percent >= start_at_percentage and current_percent <= end_at_percentage:
+                                x_orig = z
+                                log.info(f"CFG Skimming applied: {skimming_type} - Before: mean={noise_pred_uncond.mean().item():.4f}, sum={noise_pred_uncond.sum().item():.4f}, shape={noise_pred_uncond.shape}")
+                                if skimming_type == "replace":
+                                    mask = SkimmingUtils.get_skimming_mask(x_orig, noise_pred_cond, noise_pred_uncond, cfg_scale, effective_disable)
+                                    if full_skim_negative:
+                                        noise_pred_uncond_before = noise_pred_uncond.clone()
+                                        noise_pred_uncond[mask] = noise_pred_cond[mask]
+                                        log.info(f"After replace: mean={noise_pred_uncond.mean().item():.4f}, sum={noise_pred_uncond.sum().item():.4f}, diff_mean={(noise_pred_uncond - noise_pred_uncond_before).mean().item():.4f}")
+                                elif skimming_type == "linear_interp":
+                                    noise_pred_uncond_before = noise_pred_uncond.clone()
+                                    noise_pred_uncond = SkimmingUtils.skimmed_CFG(x_orig, noise_pred_uncond, noise_pred_cond, cfg_scale, Skimming_CFG, effective_disable)
+                                    log.info(f"After linear_interp: mean={noise_pred_uncond.mean().item():.4f}, sum={noise_pred_uncond.sum().item():.4f}, diff_mean={(noise_pred_uncond - noise_pred_uncond_before).mean().item():.4f}")
+                                elif skimming_type == "dual_scales":
+                                    noise_pred_cond_before = noise_pred_cond.clone()
+                                    noise_pred_uncond_before = noise_pred_uncond.clone()
+                                    noise_pred_cond = SkimmingUtils.skimmed_CFG(x_orig, noise_pred_cond, noise_pred_uncond, cfg_scale, Skimming_CFG, effective_disable)
+                                    noise_pred_uncond = SkimmingUtils.skimmed_CFG(x_orig, noise_pred_uncond, noise_pred_cond_before, cfg_scale, Skimming_CFG_Dual, effective_disable)
+                                    log.info(f"After dual_scales: cond_mean={noise_pred_cond.mean().item():.4f}, uncond_mean={noise_pred_uncond.mean().item():.4f}, cond_diff_mean={(noise_pred_cond - noise_pred_cond_before).mean().item():.4f}, uncond_diff_mean={(noise_pred_uncond - noise_pred_uncond_before).mean().item():.4f}")
+                                elif skimming_type == "difference":
+                                    noise_pred_uncond_before = noise_pred_uncond.clone()
+                                    if current_percent < end_at_percentage:
+                                        noise_pred_uncond = SkimmingUtils.interpolated_scales(x_orig, noise_pred_cond, noise_pred_uncond, cfg_scale, Skimming_CFG, method == "squared_distance", method == "root_distance")
+                                    log.info(f"After difference: mean={noise_pred_uncond.mean().item():.4f}, sum={noise_pred_uncond.sum().item():.4f}, diff_mean={(noise_pred_uncond - noise_pred_uncond_before).mean().item():.4f}")
+                        
                         #phantom
                         if use_phantom and not math.isclose(phantom_cfg_scale[idx], 1.0):
                             noise_pred_phantom, cache_state_phantom = transformer(
@@ -3793,6 +3892,7 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoAddStandInLatent": WanVideoAddStandInLatent,
     "WanVideoAddControlEmbeds": WanVideoAddControlEmbeds,
     "WanVideoRoPEFunction": WanVideoRoPEFunction,
+    "SkimmingCFGArgs": SkimmingCFGArgs,
     }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoSampler": "WanVideo Sampler",
@@ -3826,4 +3926,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoAddStandInLatent": "WanVideo Add StandIn Latent",
     "WanVideoAddControlEmbeds": "WanVideo Add Control Embeds",
     "WanVideoRoPEFunction": "WanVideo RoPE Function",
+    "SkimmingCFGArgs": "WanVideo Skimming CFG Args (BETA)",
     }
