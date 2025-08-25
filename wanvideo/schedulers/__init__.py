@@ -8,7 +8,6 @@ from .scheduling_flow_match_lcm import FlowMatchLCMScheduler
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler, DEISMultistepScheduler
 from .fm_solvers_euler import EulerScheduler
 
-import numpy as np
 import inspect
 from ...utils import log
 
