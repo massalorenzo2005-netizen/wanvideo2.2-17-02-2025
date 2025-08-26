@@ -2593,6 +2593,57 @@ class WanVideoSampler:
                         raise ValueError("Negative embeddings must be provided for CFG scale > 1.0")
                     if len(positive_embeds) > 1:
                         negative_embeds = negative_embeds * len(positive_embeds)
+                
+                # Add padding for positive_embeds and negative_embeds when using CFG skimming
+                if use_cfg_skimming:
+                    tokens_align = True  # Internal parameter: True to align negative to positive length, False to pad both to 512
+                    # Determine target sequence length
+                    if tokens_align:
+                        first_positive_emb = positive_embeds[0]
+                        target_length = first_positive_emb.shape[0] if len(first_positive_emb.shape) == 2 else first_positive_emb.shape[1]
+                        del first_positive_emb  # Free memory
+                    else:
+                        target_length = 512  # Fixed length from T5 configuration
+
+                    # Process prompt_embeds in-place
+                    for i in range(len(positive_embeds)):
+                        emb = positive_embeds[i]
+                        embed_seq_len = 0
+                        if isinstance(emb, torch.Tensor):
+                            embed_seq_len = emb.shape[0] if len(emb.shape) == 2 else emb.shape[1]
+                            if embed_seq_len < target_length:
+                                padding = torch.zeros((target_length - embed_seq_len, emb.shape[-1]), dtype=emb.dtype, device=emb.device)
+                                if len(emb.shape) == 3:
+                                    padding = padding.unsqueeze(0)
+                                positive_embeds[i] = torch.cat([emb, padding], dim=0 if len(emb.shape) == 2 else 1)
+                                del padding  # Free memory
+                        if cs_verbose:
+                            if isinstance(emb, torch.Tensor):
+                                log.info(f"Padded prompt_embeds[{i}]: shape={list(positive_embeds[i].shape)}, mean={torch.mean(positive_embeds[i]).item():.4f}, sum={torch.sum(positive_embeds[i]).item():.4f}")
+                            else:
+                                log.info(f"prompt_embeds[{i}]: not a tensor, type={type(emb)}")
+
+                    # Process negative_prompt_embeds in-place
+                    for i in range(len(negative_embeds)):
+                        emb = negative_embeds[i]
+                        embed_seq_len = 0
+                        if isinstance(emb, torch.Tensor):
+                            embed_seq_len = emb.shape[0] if len(emb.shape) == 2 else emb.shape[1]
+                            if embed_seq_len < target_length:
+                                padding = torch.zeros((target_length - embed_seq_len, emb.shape[-1]), dtype=emb.dtype, device=emb.device)
+                                if len(emb.shape) == 3:
+                                    padding = padding.unsqueeze(0)
+                                negative_embeds[i] = torch.cat([emb, padding], dim=0 if len(emb.shape) == 2 else 1)
+                                del padding  # Free memory
+                        if cs_verbose:
+                            if isinstance(emb, torch.Tensor):
+                                log.info(f"Padded negative_prompt_embeds[{i}]: shape={list(negative_embeds[i].shape)}, mean={torch.mean(negative_embeds[i]).item():.4f}, sum={torch.sum(negative_embeds[i]).item():.4f}")
+                            else:
+                                log.info(f"negative_prompt_embeds[{i}]: not a tensor, type={type(emb)}")
+
+                    # Update text_embeds dictionary
+                    text_embeds["prompt_embeds"] = positive_embeds
+                    text_embeds["negative_prompt_embeds"] = negative_embeds
 
                 try:
                     if not batched_cfg:
@@ -2627,59 +2678,6 @@ class WanVideoSampler:
                             **base_params
                         )
                         noise_pred_uncond = noise_pred_uncond[0].to(intermediate_device)
-                                                
-                        # code based on Skimmed_CFG by Extraltodeus (https://github.com/Extraltodeus/Skimmed_CFG)
-                        # Apply CFG skimming if enabled and uncond is non-zero
-                        if use_cfg_skimming and torch.any(noise_pred_uncond):
-                            # Store initial tensor stats for verbose logging
-                            if cs_verbose:
-                                cond_mean_before = torch.mean(noise_pred_cond).item()
-                                cond_sum_before = torch.sum(noise_pred_cond).item()
-                                uncond_mean_before = torch.mean(noise_pred_uncond).item()
-                                uncond_sum_before = torch.sum(noise_pred_uncond).item()
-                            
-                            if cs_mode == "Single Scale":
-                                # Single Scale mode: Adjust both cond and uncond using skimmed_CFG
-                                noise_pred_cond = skimmed_CFG(noise_pred_cond, noise_pred_uncond, cfg_scale, cs_skimming_cfg, cs_disable_flipping_filter)
-                                noise_pred_uncond = skimmed_CFG(noise_pred_uncond, noise_pred_cond, cfg_scale, 0 if cs_full_skim_negative else cs_skimming_cfg, cs_disable_flipping_filter)
-                            
-                            elif cs_mode == "Replace":
-                                # Replace mode: Replace uncond values with cond where mask is True
-                                cond = noise_pred_cond
-                                uncond = noise_pred_uncond
-                                # START OF CHANGES: Add z as x_orig to get_skimming_mask
-                                skim_mask = get_skimming_mask(z, cond, uncond, cfg_scale)
-                                uncond[skim_mask] = cond[skim_mask]
-                                skim_mask = get_skimming_mask(z, uncond, cond, cfg_scale)
-                                # END OF CHANGES
-                                uncond[skim_mask] = cond[skim_mask]
-                                noise_pred_uncond = uncond
-                            
-                            elif cs_mode == "Linear Interpolation":
-                                # Linear Interpolation mode: Blend cond and uncond using a single scale
-                                fallback_weight = cs_skimming_cfg / cfg_scale
-                                skim_mask = get_skimming_mask(z, noise_pred_cond, noise_pred_uncond, cfg_scale)
-                                noise_pred_uncond[skim_mask] = noise_pred_cond[skim_mask] * (1 - fallback_weight) + noise_pred_uncond[skim_mask] * fallback_weight
-                                skim_mask = get_skimming_mask(z, noise_pred_uncond, noise_pred_cond, cfg_scale)
-                                noise_pred_uncond[skim_mask] = noise_pred_cond[skim_mask] * (1 - fallback_weight) + noise_pred_uncond[skim_mask] * fallback_weight
-                            
-                            elif cs_mode == "Linear Interpolation Dual Scales":
-                                # Linear Interpolation Dual Scales mode: Blend using separate positive and negative scales
-                                fallback_weight_positive = cs_skimming_cfg / cfg_scale
-                                fallback_weight_negative = cs_skimming_cfg_negative / cfg_scale
-                                skim_mask = get_skimming_mask(z, noise_pred_uncond, noise_pred_cond, cfg_scale)
-                                noise_pred_uncond[skim_mask] = noise_pred_cond[skim_mask] * (1 - fallback_weight_negative) + noise_pred_uncond[skim_mask] * fallback_weight_negative
-                                skim_mask = get_skimming_mask(z, noise_pred_cond, noise_pred_uncond, cfg_scale)
-                                noise_pred_uncond[skim_mask] = noise_pred_cond[skim_mask] * (1 - fallback_weight_positive) + noise_pred_uncond[skim_mask] * fallback_weight_positive
-                            
-                            # Log tensor stats after skimming if verbose is enabled
-                            if cs_verbose:
-                                cond_mean_after = torch.mean(noise_pred_cond).item()
-                                cond_sum_after = torch.sum(noise_pred_cond).item()
-                                uncond_mean_after = torch.mean(noise_pred_uncond).item()
-                                uncond_sum_after = torch.sum(noise_pred_uncond).item()
-                                log.info(f"CFG Skimming applied: {cs_mode} - Before: mean=[{cond_mean_before:.4f}, {uncond_mean_before:.4f}], sum=[{cond_sum_before:.4f}, {uncond_sum_before:.4f}] - After: mean=[{cond_mean_after:.4f}, {uncond_mean_after:.4f}], sum=[{cond_sum_after:.4f}, {uncond_sum_after:.4f}]")
-                                
                         #phantom
                         if use_phantom and not math.isclose(phantom_cfg_scale[idx], 1.0):
                             noise_pred_phantom, cache_state_phantom = transformer(
@@ -2758,8 +2756,7 @@ class WanVideoSampler:
                         noise_pred_cond.view(batch_size, -1),
                         noise_pred_uncond.view(batch_size, -1)
                     ).view(batch_size, 1, 1, 1)
-                    
-                
+                                
                 noise_pred_uncond_scaled = noise_pred_uncond * alpha
 
                 if use_tangential:
@@ -2782,6 +2779,93 @@ class WanVideoSampler:
                 else:
                     noise_pred = noise_pred_uncond_scaled + cfg_scale * (noise_pred_cond - noise_pred_uncond_scaled)
                 
+                """ 
+                if use_cfg_skimming and cs_verbose:
+                    # Handle positive_embeds (list or tensor)
+                    for i, emb in enumerate(positive_embeds):
+                        if isinstance(emb, torch.Tensor):
+                            torch.save(emb, f"positive_embeds_{i}.pt")
+                            log.info(f"Saved positive_embeds[{i}] to positive_embeds_{i}.pt: shape={list(emb.shape)}, mean={torch.mean(emb).item():.4f}, sum={torch.sum(emb).item():.4f}")
+                        else:
+                            log.info(f"positive_embeds[{i}]: not a tensor, type={type(emb)}")
+
+                    # Handle negative_embeds (list or tensor)
+                    for i, emb in enumerate(negative_embeds):
+                        if isinstance(emb, torch.Tensor):
+                            torch.save(emb, f"negative_embeds_{i}.pt")
+                            log.info(f"Saved negative_embeds[{i}] to negative_embeds_{i}.pt: shape={list(emb.shape)}, mean={torch.mean(emb).item():.4f}, sum={torch.sum(emb).item():.4f}")
+                        else:
+                            log.info(f"negative_embeds[{i}]: not a tensor, type={type(emb)}")
+                """
+                #TODO: use noise_pred_uncond_scaled?
+                # code based on Skimmed_CFG by Extraltodeus (https://github.com/Extraltodeus/Skimmed_CFG)
+                # Apply CFG skimming if enabled
+                if use_cfg_skimming:
+                    # Store initial tensor stats for verbose logging
+                    if cs_verbose:
+                        cond_mean_before = torch.mean(noise_pred_cond).item()
+                        cond_sum_before = torch.sum(noise_pred_cond).item()
+                        uncond_mean_before = torch.mean(noise_pred_uncond).item()
+                        uncond_sum_before = torch.sum(noise_pred_uncond).item()
+                    
+                    if cs_mode == "Single Scale":
+                        # Single Scale mode: Adjust both cond and uncond using skimmed_CFG
+                        noise_pred_uncond = skimmed_CFG(z, noise_pred_uncond, noise_pred_cond, cfg_scale, cs_skimming_cfg if not cs_full_skim_negative else 0, cs_disable_flipping_filter)
+                        noise_pred_cond = skimmed_CFG(z, noise_pred_cond, noise_pred_uncond, cfg_scale, cs_skimming_cfg, cs_disable_flipping_filter)
+                    
+                    elif cs_mode == "Replace":
+                        # Replace mode: Replace uncond values with cond where mask is True
+                        cond = noise_pred_cond
+                        uncond = noise_pred_uncond
+                        # Add z as x_orig to get_skimming_mask
+                        skim_mask = get_skimming_mask(z, cond, uncond, cfg_scale)
+                        uncond[skim_mask] = cond[skim_mask]
+                        skim_mask = get_skimming_mask(z, uncond, cond, cfg_scale)
+                        uncond[skim_mask] = cond[skim_mask]
+                        noise_pred_uncond = uncond
+                    
+                    # elif cs_mode == "Linear Interpolation":
+                    #     # Linear Interpolation mode: Blend cond and uncond using a single scale
+                    #     fallback_weight = cs_skimming_cfg / cfg_scale
+                    #     skim_mask = get_skimming_mask(z, noise_pred_cond, noise_pred_uncond, cfg_scale)
+                    #     noise_pred_uncond[skim_mask] = noise_pred_cond[skim_mask] * (1 - fallback_weight) + noise_pred_uncond[skim_mask] * fallback_weight
+                    #     skim_mask = get_skimming_mask(z, noise_pred_uncond, noise_pred_cond, cfg_scale)
+                    #     noise_pred_uncond[skim_mask] = noise_pred_cond[skim_mask] * (1 - fallback_weight) + noise_pred_uncond[skim_mask] * fallback_weight
+                    
+                    # elif cs_mode == "Linear Interpolation Dual Scales":
+                    #     # Linear Interpolation Dual Scales mode: Blend using separate positive and negative scales
+                    #     fallback_weight_positive = cs_skimming_cfg / cfg_scale
+                    #     fallback_weight_negative = cs_skimming_cfg_negative / cfg_scale
+                    #     skim_mask = get_skimming_mask(z, noise_pred_uncond, noise_pred_cond, cfg_scale)
+                    #     noise_pred_uncond[skim_mask] = noise_pred_cond[skim_mask] * (1 - fallback_weight_negative) + noise_pred_uncond[skim_mask] * fallback_weight_negative
+                    #     skim_mask = get_skimming_mask(z, noise_pred_cond, noise_pred_uncond, cfg_scale)
+                    #     noise_pred_uncond[skim_mask] = noise_pred_cond[skim_mask] * (1 - fallback_weight_positive) + noise_pred_uncond[skim_mask] * fallback_weight_positive
+                    
+                    #
+                    elif cs_mode in ["Linear Interpolation", "Linear Interpolation Dual Scales"]:
+                        # Linear Interpolation mode: Blend cond and uncond using a single scale
+                        # Linear Interpolation Dual Scales mode: Blend using separate positive and negative scales
+                        fallback_weight_uncond = cs_skimming_cfg / cfg_scale
+                        fallback_weight_cond = cs_skimming_cfg_negative / cfg_scale if cs_mode == "Linear Interpolation Dual Scales" else fallback_weight_uncond
+
+                        # Blend where uncond influences cond
+                        skim_mask = get_skimming_mask(z, noise_pred_cond, noise_pred_uncond, cfg_scale)
+                        noise_pred_uncond[skim_mask] = noise_pred_cond[skim_mask] * (1 - fallback_weight_uncond) + noise_pred_uncond[skim_mask] * fallback_weight_uncond
+
+                        # Blend where cond influences uncond
+                        skim_mask = get_skimming_mask(z, noise_pred_uncond, noise_pred_cond, cfg_scale)
+                        noise_pred_uncond[skim_mask] = noise_pred_cond[skim_mask] * (1 - fallback_weight_cond) + noise_pred_uncond[skim_mask] * fallback_weight_cond
+                    #
+                    
+                    # Log tensor stats after skimming if verbose is enabled
+                    if cs_verbose:
+                        cond_mean_after = torch.mean(noise_pred_cond).item()
+                        cond_sum_after = torch.sum(noise_pred_cond).item()
+                        uncond_mean_after = torch.mean(noise_pred_uncond).item()
+                        uncond_sum_after = torch.sum(noise_pred_uncond).item()
+                        log.info(f"CFG Skimming applied {cs_mode} with {cs_skimming_cfg}:")
+                        log.info(f"Before: mean=[{cond_mean_before:.4f}, {uncond_mean_before:.4f}], sum=[{cond_sum_before:.4f}, {uncond_sum_before:.4f}]")
+                        log.info(f"After: mean=[{cond_mean_after:.4f}, {uncond_mean_after:.4f}], sum=[{cond_sum_after:.4f}, {uncond_sum_after:.4f}]")               
 
                 return noise_pred, [cache_state_cond, cache_state_uncond]
 
