@@ -6,7 +6,6 @@ from tqdm import tqdm
 import inspect
 import hashlib
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
-
 from .wanvideo.modules.model import rope_params
 from .custom_linear import remove_lora_from_module, set_lora_params
 from .wanvideo.schedulers import get_scheduler, get_sampling_sigmas, retrieve_timesteps, scheduler_list
@@ -19,13 +18,10 @@ from .cache_methods.cache_methods import cache_report
 from .nodes_model_loading import load_weights
 from .enhance_a_video.globals import set_enhance_weight, set_num_frames
 from .taehv import TAEHV
-
 from .CFGSkimming.skimming_utils import get_skimming_mask, skimmed_CFG
-
 from contextlib import nullcontext
 
 from einops import rearrange
-
 from comfy import model_management as mm
 from comfy.utils import ProgressBar, common_upscale
 from comfy.clip_vision import clip_preprocess, ClipVisionModel
@@ -46,18 +42,21 @@ def offload_transformer(transformer):
     transformer.teacache_state.clear_all()
     transformer.magcache_state.clear_all()
     transformer.easycache_state.clear_all()
-    #transformer.to(offload_device)
-    for name, param in transformer.named_parameters():
-        module = transformer
-        subnames = name.split('.')
-        for subname in subnames[:-1]:
-            module = getattr(module, subname)
-        attr_name = subnames[-1]
-        if param.data.is_floating_point():
-            meta_param = torch.nn.Parameter(torch.empty_like(param.data, device='meta'), requires_grad=False)
-            setattr(module, attr_name, meta_param)
-        else:
-            pass
+    
+    if transformer.patched_linear:
+        for name, param in transformer.named_parameters():
+            module = transformer
+            subnames = name.split('.')
+            for subname in subnames[:-1]:
+                module = getattr(module, subname)
+            attr_name = subnames[-1]
+            if param.data.is_floating_point():
+                meta_param = torch.nn.Parameter(torch.empty_like(param.data, device='meta'), requires_grad=False)
+                setattr(module, attr_name, meta_param)
+            else:
+                pass
+    else:
+        transformer.to(offload_device)
     mm.soft_empty_cache()
     gc.collect()
 
@@ -1876,9 +1875,9 @@ class WanVideoSampler:
             timesteps = scheduler["timesteps"]
         elif scheduler != "multitalk":
             sample_scheduler, timesteps = get_scheduler(scheduler, steps, start_step, end_step, shift, device, transformer.dim, flowedit_args, denoise_strength, sigmas=sigmas)
-            log.info(f"sigmas: {sample_scheduler.sigmas}")
         else:
             timesteps = torch.tensor([1000, 750, 500, 250], device=device)
+        log.info(f"sigmas: {sample_scheduler.sigmas}")
         total_steps = steps
         steps = len(timesteps)
 
@@ -2748,12 +2747,63 @@ class WanVideoSampler:
                 }
 
                 batch_size = 1
-
+                
                 if not math.isclose(cfg_scale, 1.0):
                     if negative_embeds is None:
                         raise ValueError("Negative embeddings must be provided for CFG scale > 1.0")
                     if len(positive_embeds) > 1:
                         negative_embeds = negative_embeds * len(positive_embeds)
+                
+                # Add padding for positive_embeds and negative_embeds when using CFG skimming
+                if use_cfg_skimming:
+                    tokens_align = True  # Internal parameter: True to align negative to positive length, False to pad both to 512 TODO: check if this matters, guess not
+                    # Determine target sequence length
+                    if tokens_align:
+                        first_positive_emb = positive_embeds[0]
+                        target_length = first_positive_emb.shape[0] if len(first_positive_emb.shape) == 2 else first_positive_emb.shape[1]
+                        del first_positive_emb  # Free memory
+                    else:
+                        target_length = 512  # Fixed length from T5 configuration
+
+                    # Process prompt_embeds in-place
+                    for i in range(len(positive_embeds)):
+                        emb = positive_embeds[i]
+                        embed_seq_len = 0
+                        if isinstance(emb, torch.Tensor):
+                            embed_seq_len = emb.shape[0] if len(emb.shape) == 2 else emb.shape[1]
+                            if embed_seq_len < target_length:
+                                padding = torch.zeros((target_length - embed_seq_len, emb.shape[-1]), dtype=emb.dtype, device=emb.device)
+                                if len(emb.shape) == 3:
+                                    padding = padding.unsqueeze(0)
+                                positive_embeds[i] = torch.cat([emb, padding], dim=0 if len(emb.shape) == 2 else 1)
+                                del padding  # Free memory
+                        if cs_verbose:
+                            if isinstance(emb, torch.Tensor):
+                                log.info(f"Padded prompt_embeds[{i}]: shape={list(positive_embeds[i].shape)}, mean={torch.mean(positive_embeds[i]).item():.4f}, sum={torch.sum(positive_embeds[i]).item():.4f}")
+                            else:
+                                log.info(f"prompt_embeds[{i}]: not a tensor, type={type(emb)}")
+
+                    # Process negative_prompt_embeds in-place
+                    for i in range(len(negative_embeds)):
+                        emb = negative_embeds[i]
+                        embed_seq_len = 0
+                        if isinstance(emb, torch.Tensor):
+                            embed_seq_len = emb.shape[0] if len(emb.shape) == 2 else emb.shape[1]
+                            if embed_seq_len < target_length:
+                                padding = torch.zeros((target_length - embed_seq_len, emb.shape[-1]), dtype=emb.dtype, device=emb.device)
+                                if len(emb.shape) == 3:
+                                    padding = padding.unsqueeze(0)
+                                negative_embeds[i] = torch.cat([emb, padding], dim=0 if len(emb.shape) == 2 else 1)
+                                del padding  # Free memory
+                        if cs_verbose:
+                            if isinstance(emb, torch.Tensor):
+                                log.info(f"Padded negative_prompt_embeds[{i}]: shape={list(negative_embeds[i].shape)}, mean={torch.mean(negative_embeds[i]).item():.4f}, sum={torch.sum(negative_embeds[i]).item():.4f}")
+                            else:
+                                log.info(f"negative_prompt_embeds[{i}]: not a tensor, type={type(emb)}")
+
+                    # Update text_embeds dictionary
+                    text_embeds["prompt_embeds"] = positive_embeds
+                    text_embeds["negative_prompt_embeds"] = negative_embeds
 
                 # Add padding for positive_embeds and negative_embeds when using CFG skimming
                 if use_cfg_skimming:
@@ -2917,77 +2967,81 @@ class WanVideoSampler:
                         noise_pred_cond.view(batch_size, -1),
                         noise_pred_uncond.view(batch_size, -1)
                     ).view(batch_size, 1, 1, 1)
-
                 noise_pred_uncond_scaled = noise_pred_uncond * alpha
 
                 if use_tangential:
                     noise_pred_uncond_scaled = tangential_projection(noise_pred_cond, noise_pred_uncond_scaled)
-
-                # RAAG (RATIO-aware Adaptive Guidance)
-                if raag_alpha > 0.0:
-                    cfg_scale = get_raag_guidance(noise_pred_cond, noise_pred_uncond_scaled, cfg_scale, raag_alpha)
-                    log.info(f"RAAG modified cfg: {cfg_scale}")
-
-                #https://github.com/WikiChao/FreSca
-                if use_fresca:
-                    filtered_cond = fourier_filter(
-                        noise_pred_cond - noise_pred_uncond,
-                        scale_low=fresca_scale_low,
-                        scale_high=fresca_scale_high,
-                        freq_cutoff=fresca_freq_cutoff,
-                    )
-                    noise_pred = noise_pred_uncond_scaled + cfg_scale * filtered_cond * alpha
-                else:
-                    noise_pred = noise_pred_uncond_scaled + cfg_scale * (noise_pred_cond - noise_pred_uncond_scaled)
                 
-                #TODO: use noise_pred_uncond_scaled?
                 # code based on Skimmed_CFG by Extraltodeus (https://github.com/Extraltodeus/Skimmed_CFG)
+                # Fix: now proper order and proper scaling of CFG skimming
+                # CFG-Zero-star → Tangential → CFG Skimming → RAAG → FreSca
                 # Apply CFG skimming if enabled
                 if use_cfg_skimming:
                     # Store initial tensor stats for verbose logging
                     if cs_verbose:
                         cond_mean_before = torch.mean(noise_pred_cond).item()
                         cond_sum_before = torch.sum(noise_pred_cond).item()
-                        uncond_mean_before = torch.mean(noise_pred_uncond).item()
-                        uncond_sum_before = torch.sum(noise_pred_uncond).item()
+                        uncond_mean_before = torch.mean(noise_pred_uncond_scaled).item()
+                        uncond_sum_before = torch.sum(noise_pred_uncond_scaled).item()
                     
                     if cs_mode == "Single Scale":
                         # Single Scale mode: Adjust both cond and uncond using skimmed_CFG
-                        noise_pred_uncond = skimmed_CFG(z, noise_pred_uncond, noise_pred_cond, cfg_scale, cs_skimming_cfg if not cs_full_skim_negative else 0, cs_disable_flipping_filter)
-                        noise_pred_cond = skimmed_CFG(z, noise_pred_cond, noise_pred_uncond, cfg_scale, cs_skimming_cfg, cs_disable_flipping_filter)
+                        noise_pred_uncond_scaled = skimmed_CFG(z, noise_pred_uncond_scaled, noise_pred_cond, cfg_scale, cs_skimming_cfg if not cs_full_skim_negative else 0, cs_disable_flipping_filter)  
+                        noise_pred_cond = skimmed_CFG(z, noise_pred_cond, noise_pred_uncond_scaled, cfg_scale - 1, cs_skimming_cfg, cs_disable_flipping_filter)  
                     
                     elif cs_mode == "Replace":
                         # Replace mode: Replace uncond values with cond where mask is True
-                        cond = noise_pred_cond
-                        uncond = noise_pred_uncond
-                        # Add z as x_orig to get_skimming_mask
-                        skim_mask = get_skimming_mask(z, cond, uncond, cfg_scale)
-                        uncond[skim_mask] = cond[skim_mask]
-                        skim_mask = get_skimming_mask(z, uncond, cond, cfg_scale)
-                        uncond[skim_mask] = cond[skim_mask]
-                        noise_pred_uncond = uncond
+                        cond = noise_pred_cond  
+                        uncond = noise_pred_uncond_scaled  
+      
+                        skim_mask = get_skimming_mask(z, cond, uncond, cfg_scale)  
+                        uncond[skim_mask] = cond[skim_mask]  
+                        
+                        skim_mask = get_skimming_mask(z, uncond, cond, cfg_scale - 1)  
+                        uncond[skim_mask] = cond[skim_mask]  
+                        
+                        noise_pred_uncond_scaled = uncond  
+
                     elif cs_mode in ["Linear Interpolation", "Linear Interpolation Dual Scales"]:
                         # Linear Interpolation mode: Blend cond and uncond using a single scale
                         # Linear Interpolation Dual Scales mode: Blend using separate positive and negative scales
-                        fallback_weight_uncond = cs_skimming_cfg / cfg_scale
-                        fallback_weight_cond = cs_skimming_cfg_negative / cfg_scale if cs_mode == "Linear Interpolation Dual Scales" else fallback_weight_uncond
+                        fallback_weight_uncond = (cs_skimming_cfg - 1) / (cfg_scale - 1)  
+                        fallback_weight_cond = (cs_skimming_cfg_negative - 1) / (cfg_scale - 1) if cs_mode == "Linear Interpolation Dual Scales" else fallback_weight_uncond
 
                         # Blend where uncond influences cond
-                        skim_mask = get_skimming_mask(z, noise_pred_cond, noise_pred_uncond, cfg_scale)
-                        noise_pred_uncond[skim_mask] = noise_pred_cond[skim_mask] * (1 - fallback_weight_uncond) + noise_pred_uncond[skim_mask] * fallback_weight_uncond
+                        skim_mask = get_skimming_mask(z, noise_pred_cond, noise_pred_uncond_scaled, cfg_scale)
+                        noise_pred_uncond_scaled[skim_mask] = noise_pred_cond[skim_mask] * (1 - fallback_weight_uncond) + noise_pred_uncond_scaled[skim_mask] * fallback_weight_uncond
 
                         # Blend where cond influences uncond
-                        skim_mask = get_skimming_mask(z, noise_pred_uncond, noise_pred_cond, cfg_scale)
-                        noise_pred_uncond[skim_mask] = noise_pred_cond[skim_mask] * (1 - fallback_weight_cond) + noise_pred_uncond[skim_mask] * fallback_weight_cond
+                        skim_mask = get_skimming_mask(z, noise_pred_uncond_scaled, noise_pred_cond, cfg_scale)
+                        noise_pred_uncond_scaled[skim_mask] = noise_pred_cond[skim_mask] * (1 - fallback_weight_cond) + noise_pred_uncond_scaled[skim_mask] * fallback_weight_cond          
+                    
                     # Log tensor stats after skimming if verbose is enabled
                     if cs_verbose:
                         cond_mean_after = torch.mean(noise_pred_cond).item()
                         cond_sum_after = torch.sum(noise_pred_cond).item()
-                        uncond_mean_after = torch.mean(noise_pred_uncond).item()
-                        uncond_sum_after = torch.sum(noise_pred_uncond).item()
+                        uncond_mean_after = torch.mean(noise_pred_uncond_scaled).item()
+                        uncond_sum_after = torch.sum(noise_pred_uncond_scaled).item()
                         log.info(f"CFG Skimming applied {cs_mode} with {cs_skimming_cfg}:")
                         log.info(f"Before: mean=[{cond_mean_before:.4f}, {uncond_mean_before:.4f}], sum=[{cond_sum_before:.4f}, {uncond_sum_before:.4f}]")
-                        log.info(f"After: mean=[{cond_mean_after:.4f}, {uncond_mean_after:.4f}], sum=[{cond_sum_after:.4f}, {uncond_sum_after:.4f}]")
+                        log.info(f"After: mean=[{cond_mean_after:.4f}, {uncond_mean_after:.4f}], sum=[{cond_sum_after:.4f}, {uncond_sum_after:.4f}]")      
+
+                    # RAAG (RATIO-aware Adaptive Guidance)
+                    if raag_alpha > 0.0:
+                        cfg_scale = get_raag_guidance(noise_pred_cond, noise_pred_uncond_scaled, cfg_scale, raag_alpha)
+                        log.info(f"RAAG modified cfg: {cfg_scale}")                
+
+                    #https://github.com/WikiChao/FreSca
+                    if use_fresca:
+                        filtered_cond = fourier_filter(
+                            noise_pred_cond - noise_pred_uncond,
+                            scale_low=fresca_scale_low,
+                            scale_high=fresca_scale_high,
+                            freq_cutoff=fresca_freq_cutoff,
+                        )
+                        noise_pred = noise_pred_uncond_scaled + cfg_scale * filtered_cond * alpha
+                    else:
+                        noise_pred = noise_pred_uncond_scaled + cfg_scale * (noise_pred_cond - noise_pred_uncond_scaled)         
 
                 return noise_pred, [cache_state_cond, cache_state_uncond]
 
@@ -4102,6 +4156,23 @@ class WanVideoEncode:
  
         return ({"samples": latents, "noise_mask": mask},)
 
+class WanVideoSchedulerList: 
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                "scheduler": (scheduler_list, {"default": "unipc"}),
+            },
+        }
+
+    RETURN_TYPES = (scheduler_list, )
+    RETURN_NAMES = ("scheduler",)
+    FUNCTION = "process"
+    CATEGORY = "WanVideoWrapper"
+    EXPERIMENTAL = True
+
+    def process(self, scheduler):
+        return (scheduler,)
+
 NODE_CLASS_MAPPINGS = {
     "WanVideoSampler": WanVideoSampler,
     "WanVideoDecode": WanVideoDecode,
@@ -4136,6 +4207,7 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoAddMTVMotion": WanVideoAddMTVMotion,
     "WanVideoRoPEFunction": WanVideoRoPEFunction,
     "SkimmingCFGArgs": SkimmingCFGArgs,
+    "WanVideoSchedulerList": WanVideoSchedulerList,
     }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoSampler": "WanVideo Sampler",
@@ -4171,4 +4243,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoAddMTVMotion": "WanVideo MTV Crafter Motion",
     "WanVideoRoPEFunction": "WanVideo RoPE Function",
     "SkimmingCFGArgs": "WanVideo Skimming CFG Args (BETA)",
+    "WanVideoSchedulerList": "WanVideo Scheduler Selector",
     }

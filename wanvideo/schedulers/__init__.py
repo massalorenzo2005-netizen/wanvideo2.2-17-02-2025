@@ -9,6 +9,8 @@ from diffusers.schedulers import FlowMatchEulerDiscreteScheduler, DEISMultistepS
 import inspect
 from ...utils import log
 
+from .fm_solvers_euler import EulerScheduler
+
 scheduler_list = [
     "unipc", "unipc/beta",
     "dpm++", "dpm++/beta",
@@ -20,6 +22,7 @@ scheduler_list = [
     "flowmatch_causvid",
     "flowmatch_distill",
     "flowmatch_pusa",
+    "lightning_euler", "lightning_euler/beta", "lightning_euler/beta57",
     "multitalk"
 ]
 
@@ -94,6 +97,28 @@ def get_scheduler(scheduler, steps, start_step, end_step, shift, device, transfo
             shift=shift, sigma_min=0.0, extra_one_step=True
         )
         sample_scheduler.set_timesteps(steps, denoising_strength=denoise_strength, shift=shift, sigmas=sigmas[:-1].tolist() if sigmas is not None else None)
+    elif 'lightning_euler' in scheduler:
+        if sigmas is not None:
+            raise NotImplementedError("This scheduler does not support custom sigmas")
+
+        # --- resolve Beta shaping + (alpha, beta) for 'beta57' ---
+        use_beta = (scheduler == 'lightning_euler/beta') or (scheduler == 'lightning_euler/beta57')
+        alpha_val, beta_val = (0.6, 0.6)
+        if scheduler == 'lightning_euler/beta57':
+            alpha_val, beta_val = (0.5, 0.7)
+
+        sample_scheduler = EulerScheduler(
+            num_train_timesteps=1000,
+            shift=shift,
+            device=device,
+            use_beta_sigmas=use_beta,
+            # --- pass alpha/beta (no-op for plain lighting_euler) ---
+            alpha=alpha_val,
+            beta=beta_val,
+        )
+
+        sample_scheduler.set_timesteps(num_inference_steps=steps, device=device)
+        timesteps = sample_scheduler.timesteps[:-1].clone()    
     elif scheduler == 'res_multistep':
         sample_scheduler = FlowMatchSchedulerResMultistep(shift=shift)
         sample_scheduler.set_timesteps(steps, denoising_strength=denoise_strength, sigmas=sigmas[:-1].tolist() if sigmas is not None else None)
