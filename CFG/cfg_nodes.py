@@ -173,7 +173,14 @@ class AdvancedCFGArgs:
         Initializes the node and pre-computes the reverse mapping 
         from node name to mode for efficient lookups.
         """
-        self.NODE_TO_MODE_MAP = {v: k for k, v in self.MODE_TO_NODE_MAP.items()}
+        from collections import defaultdict
+        node_to_modes = defaultdict(list)
+        for mode, node in self.MODE_TO_NODE_MAP.items():
+            node_to_modes[node].append(mode)
+        
+        self.NODE_TO_MODE_MAP = {
+            node: modes[0] for node, modes in node_to_modes.items() if len(modes) == 1
+        }
 
     @classmethod
     def INPUT_TYPES(cls):
