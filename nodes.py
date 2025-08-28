@@ -1573,7 +1573,7 @@ class WanVideoExperimentalArgs:
         Returns:
             Tuple[dict]: A tuple containing the merged arguments dictionary.
         """
-        kwargs.update(kwargs["cfg_args"])
+        kwargs.update(kwargs.get("cfg_args") or {})
         return (kwargs,)
     
 class WanVideoFreeInitArgs:
