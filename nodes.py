@@ -6,6 +6,7 @@ from tqdm import tqdm
 import inspect
 import hashlib
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
+
 from .wanvideo.modules.model import rope_params
 from .custom_linear import remove_lora_from_module, set_lora_params
 from .wanvideo.schedulers import get_scheduler, get_sampling_sigmas, retrieve_timesteps, scheduler_list
@@ -21,6 +22,7 @@ from .taehv import TAEHV
 from .CFGSkimming.skimming_utils import get_skimming_mask, skimmed_CFG
 from contextlib import nullcontext
 from einops import rearrange
+
 from comfy import model_management as mm
 from comfy.utils import ProgressBar, common_upscale
 from comfy.clip_vision import clip_preprocess, ClipVisionModel
@@ -1548,7 +1550,7 @@ class WanVideoExperimentalArgs:
                 "bidirectional_sampling": ("BOOLEAN", {"default": False, "tooltip": "Enable bidirectional sampling, based on https://github.com/ff2416/WanFM"})
             },
             "optional": {
-                "skimming_args": ("SKIMMING_ARGS", {"tooltip": "CFG skimming parameters from SkimmingCFGArgs node (BETA)"})
+                "skimming_args": ("SKIMMING_ARGS", {"tooltip": "CFG skimming parameters from SkimmingCFGArgs node (BETA+WIP)"})
             }
         }
 
@@ -1883,7 +1885,6 @@ class WanVideoSampler:
             log.info(f"sigmas: {sample_scheduler.sigmas}")
         else:
             timesteps = torch.tensor([1000, 750, 500, 250], device=device)
-        log.info(f"sigmas: {sample_scheduler.sigmas}")
         total_steps = steps
         steps = len(timesteps)
 
@@ -2523,6 +2524,7 @@ class WanVideoSampler:
                 import copy
                 sample_scheduler_flipped = copy.deepcopy(sample_scheduler)
 
+        # Rotary positional embeddings (RoPE)
             # Extract skimming parameters from experimental_args
             skimming_args = experimental_args.get("skimming_args", {})
             if skimming_args:
@@ -2752,7 +2754,7 @@ class WanVideoSampler:
                 }
 
                 batch_size = 1
-                
+
                 if not math.isclose(cfg_scale, 1.0):
                     if negative_embeds is None:
                         raise ValueError("Negative embeddings must be provided for CFG scale > 1.0")
@@ -2921,14 +2923,15 @@ class WanVideoSampler:
                         noise_pred_cond.view(batch_size, -1),
                         noise_pred_uncond.view(batch_size, -1)
                     ).view(batch_size, 1, 1, 1)
-                                
+                    
+                
                 noise_pred_uncond_scaled = noise_pred_uncond * alpha
 
                 if use_tangential:
                     noise_pred_uncond_scaled = tangential_projection(noise_pred_cond, noise_pred_uncond_scaled)
                 
                 # code based on Skimmed_CFG by Extraltodeus (https://github.com/Extraltodeus/Skimmed_CFG)
-                #CFG-Zero-star → Tangential → CFG Skimming → RAAG → FreSca
+                # CFG-Zero-star → Tangential → CFG Skimming → RAAG → FreSca
                 # Apply CFG skimming if enabled
                 if use_cfg_skimming:
                     # Store initial tensor stats for verbose logging
@@ -2959,8 +2962,6 @@ class WanVideoSampler:
                     elif cs_mode in ["Linear Interpolation", "Linear Interpolation Dual Scales"]:
                         # Linear Interpolation mode: Blend cond and uncond using a single scale
                         # Linear Interpolation Dual Scales mode: Blend using separate positive and negative scales
-                        #fallback_weight_uncond = cs_skimming_cfg / cfg_scale
-                        #fallback_weight_cond = cs_skimming_cfg_negative / cfg_scale if cs_mode == "Linear Interpolation Dual Scales" else fallback_weight_uncond
                         fallback_weight_uncond = (cs_skimming_cfg - 1) / (cfg_scale - 1)  
                         fallback_weight_cond = (cs_skimming_cfg_negative - 1) / (cfg_scale - 1) if cs_mode == "Linear Interpolation Dual Scales" else fallback_weight_uncond
 
@@ -2970,9 +2971,7 @@ class WanVideoSampler:
 
                         # Blend where cond influences uncond
                         skim_mask = get_skimming_mask(z, noise_pred_uncond_scaled, noise_pred_cond, cfg_scale)
-                        noise_pred_uncond_scaled[skim_mask] = noise_pred_cond[skim_mask] * (1 - fallback_weight_cond) + noise_pred_uncond_scaled[skim_mask] * fallback_weight_cond      
-
-                        # Blend where uncond influences cond        
+                        noise_pred_uncond_scaled[skim_mask] = noise_pred_cond[skim_mask] * (1 - fallback_weight_cond) + noise_pred_uncond_scaled[skim_mask] * fallback_weight_cond         
                     
                     # Log tensor stats after skimming if verbose is enabled
                     if cs_verbose:
@@ -2987,7 +2986,7 @@ class WanVideoSampler:
                     # RAAG (RATIO-aware Adaptive Guidance)
                     if raag_alpha > 0.0:
                         cfg_scale = get_raag_guidance(noise_pred_cond, noise_pred_uncond_scaled, cfg_scale, raag_alpha)
-                        log.info(f"RAAG modified cfg: {cfg_scale}")                
+                        log.info(f"RAAG modified cfg: {cfg_scale}")
 
                     #https://github.com/WikiChao/FreSca
                     if use_fresca:
@@ -2999,7 +2998,7 @@ class WanVideoSampler:
                         )
                         noise_pred = noise_pred_uncond_scaled + cfg_scale * filtered_cond * alpha
                     else:
-                        noise_pred = noise_pred_uncond_scaled + cfg_scale * (noise_pred_cond - noise_pred_uncond_scaled)         
+                        noise_pred = noise_pred_uncond_scaled + cfg_scale * (noise_pred_cond - noise_pred_uncond_scaled)
 
                 return noise_pred, [cache_state_cond, cache_state_uncond]
 
