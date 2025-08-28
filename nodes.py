@@ -19,9 +19,11 @@ from .cache_methods.cache_methods import cache_report
 from .nodes_model_loading import load_weights
 from .enhance_a_video.globals import set_enhance_weight, set_num_frames
 from .taehv import TAEHV
-from .CFGSkimming.skimming_utils import get_skimming_mask, skimmed_CFG
 from contextlib import nullcontext
 from einops import rearrange
+
+#WIP+BETA Import the new CFG helper functions
+from .CFG.cfg_utils import dispatch_cfg_modification, get_cfg_log_details, apply_ssdt_dynamic_thresholding
 
 from comfy import model_management as mm
 from comfy.utils import ProgressBar, common_upscale
@@ -1550,7 +1552,7 @@ class WanVideoExperimentalArgs:
                 "bidirectional_sampling": ("BOOLEAN", {"default": False, "tooltip": "Enable bidirectional sampling, based on https://github.com/ff2416/WanFM"})
             },
             "optional": {
-                "skimming_args": ("SKIMMING_ARGS", {"tooltip": "CFG skimming parameters from SkimmingCFGArgs node (BETA)"})
+                "cfg_args": ("CFG_ARGS", {"tooltip": "CFG parameters from AdvancedCFGArgs node (WIP+BETA)"})
             }
         }
 
@@ -1562,65 +1564,16 @@ class WanVideoExperimentalArgs:
     EXPERIMENTAL = True
 
     def process(self, **kwargs):
-        if "skimming_args" in kwargs:
-            kwargs.update(kwargs["skimming_args"])
-        return (kwargs,)
-    
-class SkimmingCFGArgs:    
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                # Mode selection for different CFG skimming strategies
-                "mode": ("COMBO", {
-                    "options": ["Single Scale", "Replace", "Linear Interpolation", "Linear Interpolation Dual Scales"],
-                    "default": "Single Scale",
-                    "tooltip": "Selects the CFG skimming strategy to apply in the sampler: 'Single Scale' adjusts both positive and negative prompts using a single skimming scale; 'Replace' replaces negative prompt values with positive ones where applicable; 'Linear Interpolation' blends positive and negative prompts using a single scale; 'Linear Interpolation Dual Scales' uses separate scales for positive and negative prompts."
-                }),
-                # Skimming scale for Single Scale, Linear Interpolation, and as positive scale in Dual Scales mode
-                "Skimming_CFG": ("FLOAT", {
-                    "default": 2.0,
-                    "min": 0.0,
-                    "max": 7.0,
-                    "step": 0.5,
-                    "round": 0.01,
-                    "tooltip": "Skimming scale for Single Scale and Linear Interpolation modes, or positive scale for Dual Scales mode"
-                }),
-                # Negative skimming scale for Linear Interpolation Dual Scales mode
-                "Skimming_CFG_negative": ("FLOAT", {
-                    "default": 2.0,
-                    "min": 0.0,
-                    "max": 7.0,
-                    "step": 0.5,
-                    "round": 0.01,
-                    "tooltip": "Negative skimming scale for Linear Interpolation Dual Scales mode"
-                }),
-                # Option to fully skim negative prompt in Single Scale mode
-                "full_skim_negative": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "If enabled, fully skims the negative prompt in Single Scale mode"
-                }),
-                # Option to disable flipping filter in Single Scale mode
-                "disable_flipping_filter": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "If enabled, disables the flipping filter in Single Scale mode"
-                }),
-                # Option to enable logging of CFG skimming process
-                "verbose": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Enables logging of CFG skimming process in the sampler"
-                })
-            }
-        }
+        """
+        Processes experimental arguments, merging CFG parameters from AdvancedCFGArgs.
 
-    EXPERIMENTAL = True
-    DESCRIPTION = "CFG skimming parameters for WanVideoWrapper (BETA)"
-    RETURN_TYPES = ("SKIMMING_ARGS",)
-    RETURN_NAMES = ("skimming_args",)
-    FUNCTION = "process"
-    CATEGORY = "WanVideoWrapper"
+        Args:
+            **kwargs: Input parameters including cfg_args from AdvancedCFGArgs.
 
-    def process(self, **kwargs):
+        Returns:
+            Tuple[dict]: A tuple containing the merged arguments dictionary.
+        """
+        kwargs.update(kwargs.get("cfg_args") or {})
         return (kwargs,)
     
 class WanVideoFreeInitArgs:
@@ -2498,7 +2451,7 @@ class WanVideoSampler:
                 timesteps[-drift_steps:] = drift_timesteps[-drift_steps:]
 
         # Experimental args
-        use_cfg_zero_star = use_tangential = use_fresca = bidirectional_sampling = use_cfg_skimming = False
+        use_cfg_zero_star = use_tangential = use_fresca = bidirectional_sampling = use_cfg_advanced = False
         raag_alpha = 0.0
         if experimental_args is not None:
             video_attention_split_steps = experimental_args.get("video_attention_split_steps", [])
@@ -2524,19 +2477,12 @@ class WanVideoSampler:
                 import copy
                 sample_scheduler_flipped = copy.deepcopy(sample_scheduler)
 
-            # Extract skimming parameters from experimental_args
-            skimming_args = experimental_args.get("skimming_args", {})
-            if skimming_args:
-                use_cfg_skimming = True
-                cs_mode = skimming_args.get("mode", "Single Scale")
-                cs_skimming_cfg = skimming_args.get("Skimming_CFG", 1.0)
-                cs_skimming_cfg_negative = skimming_args.get("Skimming_CFG_negative", 1.0)
-                cs_full_skim_negative = skimming_args.get("full_skim_negative", False)
-                cs_disable_flipping_filter = skimming_args.get("disable_flipping_filter", False)
-                cs_verbose = skimming_args.get("verbose", False)
+            # Extract advanced CFG parameters from experimental_args for all supported modes
+            cfg_args = experimental_args.get("cfg_args", {})
+            if cfg_args and cfg_args.get("enabled", False):
+                use_cfg_advanced = True
 
         # Rotary positional embeddings (RoPE)
-
         # RoPE base freq scaling as used with CineScale
         ntk_alphas = [1.0, 1.0, 1.0]
         if isinstance(rope_function, dict):
@@ -2762,9 +2708,9 @@ class WanVideoSampler:
                     if len(positive_embeds) > 1:
                         negative_embeds = negative_embeds * len(positive_embeds)
                 
-                # Add padding for positive_embeds and negative_embeds when using CFG skimming
-                if use_cfg_skimming:
-                    tokens_align = True  # Internal parameter: True to align negative to positive length, False to pad both to 512 TODO: check if this matters, guess not
+                # Add padding for positive_embeds and negative_embeds for CFG modes requiring equal lengths
+                if use_cfg_advanced and cfg_args.get("mode") != "LSS-CFG":
+                    tokens_align = True  # Internal parameter: True to align negative to positive length, False to pad both to 512
                     # Determine target sequence length
                     if tokens_align:
                         first_positive_emb = positive_embeds[0]
@@ -2785,7 +2731,7 @@ class WanVideoSampler:
                                     padding = padding.unsqueeze(0)
                                 positive_embeds[i] = torch.cat([emb, padding], dim=0 if len(emb.shape) == 2 else 1)
                                 del padding  # Free memory
-                        if cs_verbose:
+                        if cfg_args.get("verbose", False):
                             if isinstance(emb, torch.Tensor):
                                 log.info(f"Padded prompt_embeds[{i}]: shape={list(positive_embeds[i].shape)}, mean={torch.mean(positive_embeds[i]).item():.4f}, sum={torch.sum(positive_embeds[i]).item():.4f}")
                             else:
@@ -2803,7 +2749,7 @@ class WanVideoSampler:
                                     padding = padding.unsqueeze(0)
                                 negative_embeds[i] = torch.cat([emb, padding], dim=0 if len(emb.shape) == 2 else 1)
                                 del padding  # Free memory
-                        if cs_verbose:
+                        if cfg_args.get("verbose", False):
                             if isinstance(emb, torch.Tensor):
                                 log.info(f"Padded negative_prompt_embeds[{i}]: shape={list(negative_embeds[i].shape)}, mean={torch.mean(negative_embeds[i]).item():.4f}, sum={torch.sum(negative_embeds[i]).item():.4f}")
                             else:
@@ -2931,66 +2877,50 @@ class WanVideoSampler:
                 if use_tangential:
                     noise_pred_uncond_scaled = tangential_projection(noise_pred_cond, noise_pred_uncond_scaled)
                 
-                # code based on Skimmed_CFG by Extraltodeus (https://github.com/Extraltodeus/Skimmed_CFG)
-                # Fix: now proper order and proper scaling of CFG skimming
-                # CFG-Zero-star → Tangential → CFG Skimming → RAAG → FreSca
-                # Apply CFG skimming if enabled
-                if use_cfg_skimming:
-                    # Store initial tensor stats for verbose logging
-                    if cs_verbose:
+                # Logic: CFG-Zero-star → Tangential → CFG advanced → RAAG → FreSca
+                # Apply advanced CFG modifications if enabled
+                if use_cfg_advanced:
+                    # --- Verbose Logging: Capture 'Before' State ---
+                    if cfg_args.get("verbose", False):
+                        mode = cfg_args.get("mode")
+                        # Call the helper function from cfg_utils to get parameter details
+                        details_str = get_cfg_log_details(cfg_args)
+
                         cond_mean_before = torch.mean(noise_pred_cond).item()
                         cond_sum_before = torch.sum(noise_pred_cond).item()
                         uncond_mean_before = torch.mean(noise_pred_uncond_scaled).item()
                         uncond_sum_before = torch.sum(noise_pred_uncond_scaled).item()
-                    
-                    if cs_mode == "Single Scale":
-                        # Single Scale mode: Adjust both cond and uncond using skimmed_CFG
-                        noise_pred_uncond_scaled = skimmed_CFG(z, noise_pred_uncond_scaled, noise_pred_cond, cfg_scale, cs_skimming_cfg if not cs_full_skim_negative else 0, cs_disable_flipping_filter)  
-                        noise_pred_cond = skimmed_CFG(z, noise_pred_cond, noise_pred_uncond_scaled, cfg_scale - 1, cs_skimming_cfg, cs_disable_flipping_filter)  
-                    
-                    elif cs_mode == "Replace":
-                        # Replace mode: Replace uncond values with cond where mask is True
-                        cond = noise_pred_cond  
-                        uncond = noise_pred_uncond_scaled  
-      
-                        skim_mask = get_skimming_mask(z, cond, uncond, cfg_scale)  
-                        uncond[skim_mask] = cond[skim_mask]  
-                        
-                        skim_mask = get_skimming_mask(z, uncond, cond, cfg_scale - 1)  
-                        uncond[skim_mask] = cond[skim_mask]  
-                        
-                        noise_pred_uncond_scaled = uncond  
 
-                    elif cs_mode in ["Linear Interpolation", "Linear Interpolation Dual Scales"]:
-                        # Linear Interpolation mode: Blend cond and uncond using a single scale
-                        # Linear Interpolation Dual Scales mode: Blend using separate positive and negative scales
-                        fallback_weight_uncond = (cs_skimming_cfg - 1) / (cfg_scale - 1)  
-                        fallback_weight_cond = (cs_skimming_cfg_negative - 1) / (cfg_scale - 1) if cs_mode == "Linear Interpolation Dual Scales" else fallback_weight_uncond
+                        log.info(f"--- Advanced CFG '{mode}' ({details_str}) [Step {idx}] ---")
+                        log.info(f"Before: cond_mean={cond_mean_before:.4f}, uncond_mean={uncond_mean_before:.4f}")
+                        log.info(f"        cond_sum={cond_sum_before:.4f}, uncond_sum={uncond_sum_before:.4f}")
 
-                        # Blend where uncond influences cond
-                        skim_mask = get_skimming_mask(z, noise_pred_cond, noise_pred_uncond_scaled, cfg_scale)
-                        noise_pred_uncond_scaled[skim_mask] = noise_pred_cond[skim_mask] * (1 - fallback_weight_uncond) + noise_pred_uncond_scaled[skim_mask] * fallback_weight_uncond
+                    # --- Clean, single call to the dispatcher ---
+                    noise_pred_cond, noise_pred_uncond_scaled = dispatch_cfg_modification(
+                        cond=noise_pred_cond,
+                        uncond=noise_pred_uncond_scaled,
+                        z=z,
+                        cfg_scale=cfg_scale,
+                        progress=current_step_percentage,
+                        cfg_args=cfg_args
+                    )
 
-                        # Blend where cond influences uncond
-                        skim_mask = get_skimming_mask(z, noise_pred_uncond_scaled, noise_pred_cond, cfg_scale)
-                        noise_pred_uncond_scaled[skim_mask] = noise_pred_cond[skim_mask] * (1 - fallback_weight_cond) + noise_pred_uncond_scaled[skim_mask] * fallback_weight_cond          
-                    
-                    # Log tensor stats after skimming if verbose is enabled
-                    if cs_verbose:
+                    # --- Verbose Logging: Capture 'After' State ---
+                    if cfg_args.get("verbose", False):
                         cond_mean_after = torch.mean(noise_pred_cond).item()
                         cond_sum_after = torch.sum(noise_pred_cond).item()
                         uncond_mean_after = torch.mean(noise_pred_uncond_scaled).item()
                         uncond_sum_after = torch.sum(noise_pred_uncond_scaled).item()
-                        log.info(f"CFG Skimming applied {cs_mode} with {cs_skimming_cfg}:")
-                        log.info(f"Before: mean=[{cond_mean_before:.4f}, {uncond_mean_before:.4f}], sum=[{cond_sum_before:.4f}, {uncond_sum_before:.4f}]")
-                        log.info(f"After: mean=[{cond_mean_after:.4f}, {uncond_mean_after:.4f}], sum=[{cond_sum_after:.4f}, {uncond_sum_after:.4f}]")      
+
+                        log.info(f"After:  cond_mean={cond_mean_after:.4f}, uncond_mean={uncond_mean_after:.4f}")
+                        log.info(f"        cond_sum={cond_sum_after:.4f}, uncond_sum={uncond_sum_after:.4f}")
 
                 # RAAG (RATIO-aware Adaptive Guidance)
                 if raag_alpha > 0.0:
                     cfg_scale = get_raag_guidance(noise_pred_cond, noise_pred_uncond_scaled, cfg_scale, raag_alpha)
                     log.info(f"RAAG modified cfg: {cfg_scale}")
 
-                #https://github.com/WikiChao/FreSca
+                # https://github.com/WikiChao/FreSca
                 if use_fresca:
                     filtered_cond = fourier_filter(
                         noise_pred_cond - noise_pred_uncond,
@@ -3000,8 +2930,28 @@ class WanVideoSampler:
                     )
                     noise_pred = noise_pred_uncond_scaled + cfg_scale * filtered_cond * alpha
                 else:
+                    # Final CFG formula for all modes
                     noise_pred = noise_pred_uncond_scaled + cfg_scale * (noise_pred_cond - noise_pred_uncond_scaled)
-                
+
+                # Apply SSDT Dynamic Thresholding AFTER final CFG
+                if use_cfg_advanced and cfg_args.get("mode") == "SSDT-CFG":
+                    threshold_percentile = cfg_args.get("threshold_percentile")
+
+                    if cfg_args.get("verbose", False):
+                        noise_pred_mean_before = torch.mean(noise_pred).item()
+                        noise_pred_sum_before = torch.sum(noise_pred).item()
+                        log.info(f"--- SSDT Dynamic Thresholding (percentile={threshold_percentile:.3f}) [Step {idx}] ---")
+                        log.info(f"Before: noise_pred_mean={noise_pred_mean_before:.4f}, noise_pred_sum={noise_pred_sum_before:.4f}")
+
+                    noise_pred = apply_ssdt_dynamic_thresholding(
+                        noise_pred=noise_pred,
+                        percentile=threshold_percentile
+                    )
+
+                    if cfg_args.get("verbose", False):
+                        noise_pred_mean_after = torch.mean(noise_pred).item()
+                        noise_pred_sum_after = torch.sum(noise_pred).item()
+                        log.info(f"After:  noise_pred_mean={noise_pred_mean_after:.4f}, noise_pred_sum={noise_pred_sum_after:.4f}")
 
                 return noise_pred, [cache_state_cond, cache_state_uncond]
 
@@ -4166,7 +4116,6 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoAddControlEmbeds": WanVideoAddControlEmbeds,
     "WanVideoAddMTVMotion": WanVideoAddMTVMotion,
     "WanVideoRoPEFunction": WanVideoRoPEFunction,
-    "SkimmingCFGArgs": SkimmingCFGArgs,
     "WanVideoSchedulerList": WanVideoSchedulerList,
     }
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -4202,6 +4151,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoAddControlEmbeds": "WanVideo Add Control Embeds",
     "WanVideoAddMTVMotion": "WanVideo MTV Crafter Motion",
     "WanVideoRoPEFunction": "WanVideo RoPE Function",
-    "SkimmingCFGArgs": "WanVideo Skimming CFG Args (BETA)",
     "WanVideoSchedulerList": "WanVideo Scheduler Selector",
     }
