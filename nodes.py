@@ -1634,6 +1634,10 @@ class WanVideoSchedulerPlotSettings:
                     "default": True, "label_on": "on", "label_off": "off",
                     "tooltip": "Enable or disable the generation of the plot."
                 }),
+                "show_sigma_values": ("BOOLEAN", {
+                    "default": False, "label_on": "on", "label_off": "off",
+                    "tooltip": "Show sigma values on the plot."
+                }),
                 "log_scale": ("BOOLEAN", {
                     "default": False, "label_on": "on", "label_off": "off",
                     "tooltip": "Use a logarithmic scale for the Y-axis of the plot."
@@ -1649,7 +1653,7 @@ class WanVideoSchedulerPlotSettings:
             }
         }
 
-    def get_settings(self, enabled, log_scale, width, height):
+    def get_settings(self, enabled, show_sigma_values, log_scale, width, height):
         """
         Packages the settings into a dictionary for other nodes to use.
 
@@ -1665,6 +1669,7 @@ class WanVideoSchedulerPlotSettings:
         settings = {
             "enabled": enabled,
             "log_scale": log_scale,
+            "show_sigma_values": show_sigma_values,
             "width": width,
             "height": height,
         }
@@ -1724,7 +1729,7 @@ class WanVideoScheduler:
         if not unique_id or not hasattr(PromptServer, 'instance') or PromptServer.instance is None:
             return
 
-        default_settings = {"enabled": True, "width": 8, "height": 5, "log_scale": False}
+        default_settings = {"enabled": True, "width": 8, "height": 5, "log_scale": False, "show_sigma_values": False}
         if plot_settings:
             default_settings.update(plot_settings)
         
@@ -1749,14 +1754,20 @@ class WanVideoScheduler:
             ax.tick_params(axis='x', colors='white') # X tick color
             ax.tick_params(axis='y', colors='white') # Y tick color
 
+            ax.set_xticks(np.arange(len(data_to_plot)))  # Force integer ticks from 0 to len-1
+            
             # Add split point if end_step is defined
             if end_idx != -1 and 0 <= end_idx < len(data_to_plot):
                 ax.axvline(end_idx, color='red', linestyle='--', linewidth=2, label='step split')
+                if default_settings["show_sigma_values"]:
+                    sigma_val = data_to_plot[end_idx]
+                    ax.text(end_idx, sigma_val, f"{sigma_val:.3f}", va='bottom', ha='right', color='white')
             # Add split point if start_step is defined    
             if start_idx > 0 and 0 <= start_idx < len(data_to_plot):
                 ax.axvline(start_idx, color='green', linestyle='--', linewidth=2, label='step split')
-            if (end_idx != -1 and 0 <= end_idx < len(data_to_plot)) or (start_idx > 0 and 0 <= start_idx < len(data_to_plot)):
-                    ax.legend(facecolor='#555555', labelcolor='white')    
+                if default_settings["show_sigma_values"]:
+                    sigma_val = data_to_plot[start_idx]
+                    ax.text(start_idx, sigma_val, f"{sigma_val:.3f}", va='bottom', ha='right', color='white')
 
             plt.tight_layout()
             buf = io.BytesIO()
