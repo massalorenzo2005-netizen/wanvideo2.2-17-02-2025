@@ -890,7 +890,7 @@ class WanVideoImageToVideoEncode:
                 start_latent_strength, end_latent_strength, start_image=None, end_image=None, control_embeds=None, fun_or_fl2v_model=False, 
                 temporal_mask=None, extra_latents=None, clip_embeds=None, tiled_vae=False, add_cond_latents=None, vae=None):
         
-        if start_image is None and end_image is None:
+        if start_image is None and end_image is None and add_cond_latents is None:
             return WanVideoEmptyEmbeds().process(
                 num_frames, width, height, control_embeds=control_embeds, extra_latents=extra_latents,
             )
@@ -987,9 +987,6 @@ class WanVideoImageToVideoEncode:
         y = vae.encode([concatenated], device, end_=(end_image is not None and not fun_or_fl2v_model),tiled=tiled_vae)[0]
         vae.model.clear_cache()
         del concatenated
-
-        if start_image is None and end_image is None:
-            y = torch.cat([mask, y])
 
         has_ref = False
         if extra_latents is not None:
@@ -3456,9 +3453,10 @@ class WanVideoSampler:
                                         partial_img_emb[:, 0] = torch.cat([image_cond[:4, 0], new_init_image], dim=0)
                                     elif context_reference_latent.shape[0] > 1:
                                         num_extra_inits = context_reference_latent.shape[0]
+                                        section_size = (latent_video_length / num_extra_inits)
                                         extra_init_index = min(int(max(c) / section_size), num_extra_inits - 1)
                                         if context_options["verbose"]:
-                                            log.info(f"extra_init_index: {extra_init_index}")
+                                            log.info(f"extra init image index: {extra_init_index}")
                                         new_init_image = context_reference_latent[extra_init_index, :, 0].to(intermediate_device)
                                         partial_img_emb[:, 0] = torch.cat([image_cond[:4, 0], new_init_image], dim=0)
                                 else:
