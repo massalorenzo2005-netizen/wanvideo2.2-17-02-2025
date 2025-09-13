@@ -24,6 +24,9 @@ from .taehv import TAEHV
 from contextlib import nullcontext
 from einops import rearrange
 
+#WIP+BETA Import the new CFG helper functions
+from .CFG.cfg_utils import dispatch_cfg_modification, get_cfg_log_details, apply_ssdt_dynamic_thresholding
+
 from comfy import model_management as mm
 from comfy.utils import ProgressBar, common_upscale, load_torch_file
 from comfy.clip_vision import clip_preprocess, ClipVisionModel
@@ -76,7 +79,6 @@ def offload_transformer(transformer):
                 pass
     else:
         transformer.to(offload_device)
-
     mm.soft_empty_cache()
     gc.collect()
 
@@ -1593,6 +1595,9 @@ class WanVideoExperimentalArgs:
                 "raag_alpha": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 10.0, "step": 0.01, "tooltip": "Alpha value for RAAG, 1.0 is default, 0.0 is disabled."}),
                 "bidirectional_sampling": ("BOOLEAN", {"default": False, "tooltip": "Enable bidirectional sampling, based on https://github.com/ff2416/WanFM"})
             },
+            "optional": {
+                "cfg_args": ("CFG_ARGS", {"tooltip": "CFG parameters from AdvancedCFGArgs node (WIP+BETA)"})
+            }
         }
 
     RETURN_TYPES = ("EXPERIMENTALARGS", )
@@ -1603,6 +1608,16 @@ class WanVideoExperimentalArgs:
     EXPERIMENTAL = True
 
     def process(self, **kwargs):
+        """
+        Processes experimental arguments, merging CFG parameters from AdvancedCFGArgs.
+
+        Args:
+            **kwargs: Input parameters including cfg_args from AdvancedCFGArgs.
+
+        Returns:
+            Tuple[dict]: A tuple containing the merged arguments dictionary.
+        """
+        kwargs.update(kwargs.get("cfg_args") or {})
         return (kwargs,)
     
 class WanVideoFreeInitArgs:
@@ -1627,100 +1642,221 @@ class WanVideoFreeInitArgs:
     def process(self, **kwargs):
         return (kwargs,)
     
-class WanVideoScheduler: #WIP
-    @classmethod
-    def INPUT_TYPES(s):
-        return {"required": {
-                "scheduler": (scheduler_list, {"default": "unipc"}),
-                "steps": ("INT", {"default": 30, "min": 1, "tooltip": "Number of steps for the scheduler"}),
-                "shift": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 1000.0, "step": 0.01}),
-                "start_step": ("INT", {"default": 0, "min": 0, "tooltip": "Starting step for the scheduler"}),
-                "end_step": ("INT", {"default": -1, "min": -1, "tooltip": "Ending step for the scheduler"})
-            },
-            "optional": {
-                "sigmas": ("SIGMAS", ),
-            },
-            "hidden": {
-                "unique_id": "UNIQUE_ID",
-            },
-        }
-
-    RETURN_TYPES = ("SIGMAS", "INT", "FLOAT", scheduler_list, "INT", "INT",)
-    RETURN_NAMES = ("sigmas", "steps", "shift", "scheduler", "start_step", "end_step")
-    FUNCTION = "process"
+# WIP
+class WanVideoSchedulerPlotSettings:
+    """
+    A node to configure settings for the Timestamps plot. It allows enabling/disabling
+    the plot, setting its dimensions, and toggling a logarithmic scale.
+    """
     CATEGORY = "WanVideoWrapper"
+    FUNCTION = "get_settings"
+    RETURN_TYPES = ("PLOT_SETTINGS",)
+    DESCRIPTION = "Configure settings for the Timestamps plot, such as size and scale."
     EXPERIMENTAL = True
 
-    def process(self, scheduler, steps, start_step, end_step, shift, unique_id, sigmas=None):
-        sample_scheduler, timesteps, start_idx, end_idx = get_scheduler(
-            scheduler, 
-            steps, 
-            start_step, end_step, shift, 
-            device, 
-            sigmas=sigmas,
-            log_timesteps=True)
-        
-        scheduler_dict = {
-            "sample_scheduler": sample_scheduler,
-            "timesteps": timesteps,
+    @classmethod
+    def INPUT_TYPES(cls):
+        """Defines the input types for the node."""
+        return {
+            "required": {
+                "enabled": ("BOOLEAN", {
+                    "default": True, "label_on": "on", "label_off": "off",
+                    "tooltip": "Enable or disable the generation of the plot."
+                }),
+                "show_sigma_values": ("BOOLEAN", {
+                    "default": False, "label_on": "on", "label_off": "off",
+                    "tooltip": "Show sigma values on the plot."
+                }),
+                "log_scale": ("BOOLEAN", {
+                    "default": False, "label_on": "on", "label_off": "off",
+                    "tooltip": "Use a logarithmic scale for the Y-axis of the plot."
+                }),
+                "width": ("INT", {
+                    "default": 8, "min": 1, "max": 40, "step": 1, "display": "slider",
+                    "tooltip": "Set the width of the plot in inches."
+                }),
+                "height": ("INT", {
+                    "default": 5, "min": 1, "max": 25, "step": 1, "display": "slider",
+                    "tooltip": "Set the height of the plot in inches."
+                }),
+            }
         }
 
+    def get_settings(self, enabled, show_sigma_values, log_scale, width, height):
+        """
+        Packages the settings into a dictionary for other nodes to use.
+
+        Args:
+            enabled (bool): Whether to generate the plot.
+            log_scale (bool): Whether to use a logarithmic scale on the Y-axis.
+            width (int): The width of the plot in inches.
+            height (int): The height of the plot in inches.
+
+        Returns:
+            tuple: A tuple containing the plot settings dictionary.
+        """
+        settings = {
+            "enabled": enabled,
+            "log_scale": log_scale,
+            "show_sigma_values": show_sigma_values,
+            "width": width,
+            "height": height,
+        }
+        return (settings,)
+    
+#WIP
+class WanVideoScheduler: 
+    """
+    A scheduler node that visualizes the timestep distribution.
+    Allows for advanced schedule slicing by absolute step or by a sigma value threshold.
+    """
+    CATEGORY = "WanVideoWrapper"
+    FUNCTION = "process"
+    RETURN_TYPES = ("SIGMAS", "INT", "FLOAT", scheduler_list, "INT", "INT",)
+    RETURN_NAMES = ("sigmas", "steps", "shift", "scheduler", "start_step", "end_step")
+    DESCRIPTION = "Create a scheduler and visualize its timesteps. Allows slicing by absolute step (end_step) or sigma threshold (end_at_sigma)."
+    EXPERIMENTAL = True
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        """Defines the input types for the node."""
+        return {
+            "required": {
+                "scheduler": (scheduler_list, {"default": "unipc"}),
+                "steps": ("INT", {"default": 30, "min": 1, "tooltip": "Total number of steps"}),
+                "shift": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 1000.0, "step": 0.01}),
+                "start_step": ("INT", {"default": 0, "min": 0, "tooltip": "Absolute starting step"}),
+                "end_step": ("INT", {"default": -1, "min": -1, "tooltip": "Absolute ending step. Ignored if end_at_sigma is >= 0."}),
+                "end_at_sigma": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 2000.0, "step": 0.001, "tooltip": "If >= 0, ends schedule when sigma drops below this value. Overrides end_step."}),
+            },
+            "optional": {
+                "sigmas": ("SIGMAS",),
+                "plot_settings": ("PLOT_SETTINGS",)
+            },
+            "hidden": {"unique_id": "UNIQUE_ID"},
+        }
+
+    def _generate_plot(self, unique_id, sample_scheduler, start_idx, end_idx, plot_settings=None):
+        """
+        Generates and sends a plot of the timesteps to the server if enabled.
+
+        Args:
+            unique_id (str): The unique identifier for the server prompt.
+            timesteps (torch.Tensor): The tensor of timesteps for plotting.
+            start_idx (int): The starting step index to visualize as a vertical line.
+            end_idx (int): The ending step index to visualize as a vertical line.
+            plot_settings (dict, optional): A dictionary of plot settings.
+        """
         try:
             from server import PromptServer
             import io
             import base64
             import matplotlib.pyplot as plt
-        except:
+        except ImportError:
             PromptServer = None
-        if unique_id and PromptServer is not None:
-            try:
-                # Plot sigmas and save to a buffer
-                sigmas_np = sample_scheduler.full_sigmas.cpu().numpy()
-                if not np.isclose(sigmas_np[-1], 0.0, atol=1e-6):
-                    sigmas_np = np.append(sigmas_np, 0.0)
-                buf = io.BytesIO()
-                fig = plt.figure(facecolor='#353535')
-                ax = fig.add_subplot(111)
-                ax.set_facecolor('#353535')  # Set axes background color
-                x_values = range(0, len(sigmas_np))
-                ax.plot(x_values, sigmas_np)
-                # Annotate each sigma value
-                ax.scatter(x_values, sigmas_np, color='white', s=20, zorder=3)  # Small dots at each sigma
-                for x, y in zip(x_values, sigmas_np):
-                    if len(sigmas_np) <= 10:  # Only annotate if few steps
-                        ax.annotate(f"{y:.3f}", (x, y), textcoords="offset points", xytext=(10, 1), ha='center', color='orange', fontsize=12)
-                ax.set_xticks(x_values)
-                ax.set_title("Sigmas", color='white')           # Title font color
-                ax.set_xlabel("Step", color='white')            # X label font color
-                ax.set_ylabel("Sigma Value", color='white')     # Y label font color
-                ax.tick_params(axis='x', colors='white', labelsize=10)        # X tick color
-                ax.tick_params(axis='y', colors='white', labelsize=10)        # Y tick color
-                # Add split point if end_step is defined
-                end_idx += 1
-                if end_idx != -1 and 0 <= end_idx < len(sigmas_np) - 1:
-                    ax.axvline(end_idx, color='red', linestyle='--', linewidth=2, label='end_step split')
-                # Add split point if start_step is defined
-                if start_idx > 0 and 0 <= start_idx < len(sigmas_np):
-                    ax.axvline(start_idx, color='green', linestyle='--', linewidth=2, label='start_step split')
-                if (end_idx != -1 and 0 <= end_idx < len(sigmas_np)) or (start_idx > 0 and 0 <= start_idx < len(sigmas_np)):
-                    ax.legend()
-                if start_idx < end_idx and 0 <= start_idx < len(sigmas_np) and 0 < end_idx < len(sigmas_np):
-                    ax.axvspan(start_idx, end_idx, color='lightblue', alpha=0.1, label='Sampled Range')
-                plt.tight_layout()
-                plt.savefig(buf, format='png')
-                plt.close(fig)
-                buf.seek(0)
-                img_base64 = base64.b64encode(buf.read()).decode('utf-8')
-                buf.close()
 
-                # Send as HTML img tag with base64 data
-                html_img = f"<img src='data:image/png;base64,{img_base64}' alt='Sigmas Plot' style='max-width:100%; height:100%; overflow:hidden; display:block;'>"
-                PromptServer.instance.send_progress_text(html_img, unique_id)
-            except Exception as e:
-                print("Failed to send sigmas plot:", e)
-                pass
+        if not unique_id or not hasattr(PromptServer, 'instance') or PromptServer.instance is None:
+            return
 
-        return (sigmas, steps, shift, scheduler_dict, start_step, end_step)
+        default_settings = {"enabled": True, "width": 8, "height": 5, "log_scale": False, "show_sigma_values": False}
+        if plot_settings:
+            default_settings.update(plot_settings)
+        
+        if not default_settings["enabled"]:
+            return
+
+        try:
+            data_to_plot = sample_scheduler.full_sigmas[:-1].cpu().numpy()
+            title, y_label = "Sigmas", "Sigma Value"
+
+            fig = plt.figure(figsize=(default_settings["width"], default_settings["height"]), facecolor='#353535')
+            ax = fig.add_subplot(111)
+            ax.set_facecolor('#353535') # Set axes background color
+            ax.plot(data_to_plot, label=y_label)
+
+            if default_settings["log_scale"]:
+                ax.set_yscale('log')
+
+            ax.set_title(title, color='white') # Title font color
+            ax.set_xlabel("Step", color='white') # X label font color
+            ax.set_ylabel(y_label, color='white') # Y label font color
+            ax.tick_params(axis='x', colors='white') # X tick color
+            ax.tick_params(axis='y', colors='white') # Y tick color
+
+            ax.set_xticks(np.arange(len(data_to_plot)))  # Force integer ticks from 0 to len-1
+            
+            # Add split point if end_step is defined
+            if end_idx != -1 and 0 <= end_idx < len(data_to_plot):
+                ax.axvline(end_idx, color='red', linestyle='--', linewidth=2, label='step split')
+                if default_settings["show_sigma_values"]:
+                    sigma_val = data_to_plot[end_idx]
+                    ax.text(end_idx, sigma_val, f"{sigma_val:.3f}", va='bottom', ha='right', color='white')
+            # Add split point if start_step is defined    
+            if start_idx > 0 and 0 <= start_idx < len(data_to_plot):
+                ax.axvline(start_idx, color='green', linestyle='--', linewidth=2, label='step split')
+                if default_settings["show_sigma_values"]:
+                    sigma_val = data_to_plot[start_idx]
+                    ax.text(start_idx, sigma_val, f"{sigma_val:.3f}", va='bottom', ha='right', color='white')
+
+            plt.tight_layout()
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png')
+            plt.close(fig)
+            buf.seek(0)
+            img_base64 = base64.b64encode(buf.read()).decode('utf-8')
+
+            html_img = f"<img src='data:image/png;base64,{img_base64}' alt='{title} Plot' style='max-width:100%; height:auto;'>"
+            PromptServer.instance.send_progress_text(html_img, unique_id)
+
+        except Exception as e:
+            print(f"Failed to generate or send plot: {e}")
+
+    def process(self, scheduler, steps, start_step, end_step, shift, end_at_sigma, unique_id, sigmas=None, plot_settings=None):
+        """
+        Processes scheduler settings, slicing the schedule by step or sigma value.
+        """
+        calculated_end_step = end_step
+
+        if end_at_sigma >= 0.0:
+            # Sigma cutoff mode has priority.
+            # First, generate the full, unsliced schedule to get all sigma values.
+            full_scheduler, _, _, _ = get_scheduler(
+                scheduler, steps, 0, -1, shift, device, sigmas=sigmas
+            )
+            
+            # Find the step (index) where the sigma value drops below the threshold.
+            full_sigmas = full_scheduler.full_sigmas
+            indices = (full_sigmas < end_at_sigma).nonzero(as_tuple=True)[0]
+            
+            if len(indices) > 0:
+                # The first index where sigma is less than the cutoff value becomes our new end_step.
+                calculated_end_step = indices[0].item()
+            else:
+                # If the condition is never met, it means all sigmas are above the cutoff.
+                # In this case, run the full schedule.
+                calculated_end_step = -1
+        
+        if calculated_end_step == 0:
+            raise ValueError("end_step cannot be 0 as it would result in an empty schedule")
+        
+        # Generate the final, potentially sliced schedule using the determined end_step.
+        sample_scheduler, timesteps, start_idx, end_idx = get_scheduler(
+            scheduler, steps, start_step, calculated_end_step, shift, device, sigmas=sigmas
+        )
+
+        # Adjust end_idx by +1 when calculated_end_step is not -1 to align the split line with the intended step (consistent with end_at_sigma logic)
+        if calculated_end_step != -1:
+            end_idx += 1
+        
+        if calculated_end_step == -1 or (calculated_end_step != -1 and calculated_end_step > steps):
+            end_idx = -1
+
+        scheduler_dict = {"sample_scheduler": sample_scheduler, "timesteps": timesteps}
+        
+        # We plot the timesteps from the *final, sliced* schedule.
+        self._generate_plot(unique_id, sample_scheduler, start_idx, end_idx, plot_settings)
+        
+        return (sigmas, steps, shift, scheduler_dict, start_step, calculated_end_step)
 
 rope_functions = ["default", "comfy", "comfy_chunked"]
 class WanVideoRoPEFunction:
@@ -1761,7 +1897,7 @@ class WanVideoSampler:
                 "model": ("WANVIDEOMODEL",),
                 "image_embeds": ("WANVIDIMAGE_EMBEDS", ),
                 "steps": ("INT", {"default": 30, "min": 1}),
-                "cfg": ("FLOAT", {"default": 6.0, "min": 0.0, "max": 30.0, "step": 0.01}),
+                "cfg": ("FLOAT", {"default": 6.0, "min": 0.0, "max": 100.0, "step": 0.01}),
                 "shift": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 1000.0, "step": 0.01}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
                 "force_offload": ("BOOLEAN", {"default": True, "tooltip": "Moves the model to the offload device after sampling"}),
@@ -1880,7 +2016,6 @@ class WanVideoSampler:
             log.info(f"sigmas: {sample_scheduler.sigmas}")
         else:
             timesteps = torch.tensor([1000, 750, 500, 250], device=device)
-
         total_steps = steps
         steps = len(timesteps)
 
@@ -2545,7 +2680,7 @@ class WanVideoSampler:
                 timesteps[-drift_steps:] = drift_timesteps[-drift_steps:]
 
         # Experimental args
-        use_cfg_zero_star = use_tangential = use_fresca = bidirectional_sampling =False
+        use_cfg_zero_star = use_tangential = use_fresca = bidirectional_sampling = use_cfg_advanced = False
         raag_alpha = 0.0
         if experimental_args is not None:
             video_attention_split_steps = experimental_args.get("video_attention_split_steps", [])
@@ -2570,8 +2705,12 @@ class WanVideoSampler:
             if bidirectional_sampling:
                 sample_scheduler_flipped = copy.deepcopy(sample_scheduler)
 
-        # Rotary positional embeddings (RoPE)
+            # Extract advanced CFG parameters from experimental_args for all supported modes
+            cfg_args = experimental_args.get("cfg_args", {})
+            if cfg_args and cfg_args.get("enabled", False):
+                use_cfg_advanced = True
 
+        # Rotary positional embeddings (RoPE)
         # RoPE base freq scaling as used with CineScale
         ntk_alphas = [1.0, 1.0, 1.0]
         if isinstance(rope_function, dict):
@@ -2806,6 +2945,47 @@ class WanVideoSampler:
                         raise ValueError("Negative embeddings must be provided for CFG scale > 1.0")
                     if len(positive_embeds) > 1:
                         negative_embeds = negative_embeds * len(positive_embeds)
+                
+                # Add padding for positive_embeds and negative_embeds for CFG modes requiring equal lengths
+                if use_cfg_advanced and cfg_args.get("mode") != "LSS-CFG":
+                    tokens_align = True  # Internal parameter: True to align negative to positive length, False to pad both to 512
+                    # Determine target sequence length
+                    if tokens_align:
+                        first_positive_emb = positive_embeds[0]
+                        target_length = first_positive_emb.shape[0] if len(first_positive_emb.shape) == 2 else first_positive_emb.shape[1]
+                        del first_positive_emb  # Free memory
+                    else:
+                        target_length = 512  # Fixed length from T5 configuration
+
+                    # Process prompt_embeds in-place
+                    for i in range(len(positive_embeds)):
+                        emb = positive_embeds[i]
+                        embed_seq_len = 0
+                        if isinstance(emb, torch.Tensor):
+                            embed_seq_len = emb.shape[0] if len(emb.shape) == 2 else emb.shape[1]
+                            if embed_seq_len < target_length:
+                                padding = torch.zeros((target_length - embed_seq_len, emb.shape[-1]), dtype=emb.dtype, device=emb.device)
+                                if len(emb.shape) == 3:
+                                    padding = padding.unsqueeze(0)
+                                positive_embeds[i] = torch.cat([emb, padding], dim=0 if len(emb.shape) == 2 else 1)
+                                del padding  # Free memory
+                      
+                    # Process negative_prompt_embeds in-place
+                    for i in range(len(negative_embeds)):
+                        emb = negative_embeds[i]
+                        embed_seq_len = 0
+                        if isinstance(emb, torch.Tensor):
+                            embed_seq_len = emb.shape[0] if len(emb.shape) == 2 else emb.shape[1]
+                            if embed_seq_len < target_length:
+                                padding = torch.zeros((target_length - embed_seq_len, emb.shape[-1]), dtype=emb.dtype, device=emb.device)
+                                if len(emb.shape) == 3:
+                                    padding = padding.unsqueeze(0)
+                                negative_embeds[i] = torch.cat([emb, padding], dim=0 if len(emb.shape) == 2 else 1)
+                                del padding  # Free memory
+
+                    # Update text_embeds dictionary
+                    text_embeds["prompt_embeds"] = positive_embeds
+                    text_embeds["negative_prompt_embeds"] = negative_embeds
 
                 try:
                     if not batched_cfg:
@@ -2924,13 +3104,52 @@ class WanVideoSampler:
 
                 if use_tangential:
                     noise_pred_uncond_scaled = tangential_projection(noise_pred_cond, noise_pred_uncond_scaled)
+                
+                # Logic: CFG-Zero-star → Tangential → CFG advanced → RAAG → FreSca
+                # Apply advanced CFG modifications if enabled
+                if use_cfg_advanced:
+                    # --- Verbose Logging: Capture 'Before' State ---
+                    if cfg_args.get("verbose", False):
+                        mode = cfg_args.get("mode")
+                        # Call the helper function from cfg_utils to get parameter details
+                        details_str = get_cfg_log_details(cfg_args)
+
+                        cond_mean_before = torch.mean(noise_pred_cond).item()
+                        cond_sum_before = torch.sum(noise_pred_cond).item()
+                        uncond_mean_before = torch.mean(noise_pred_uncond_scaled).item()
+                        uncond_sum_before = torch.sum(noise_pred_uncond_scaled).item()
+
+                        log.info(f"--- Advanced CFG '{mode}' ({details_str}) [Step {idx}] ---")
+                        log.info(f"--- Current sampler CFG: {cfg_scale} ---")
+                        log.info(f"Before: cond_mean={cond_mean_before:.4f}, uncond_mean={uncond_mean_before:.4f}")
+                        log.info(f"        cond_sum={cond_sum_before:.4f}, uncond_sum={uncond_sum_before:.4f}")
+
+                    # --- Clean, single call to the dispatcher ---
+                    noise_pred_cond, noise_pred_uncond_scaled = dispatch_cfg_modification(
+                        cond=noise_pred_cond,
+                        uncond=noise_pred_uncond_scaled,
+                        z=z,
+                        cfg_scale=cfg_scale,
+                        progress=current_step_percentage,
+                        cfg_args=cfg_args
+                    )
+
+                    # --- Verbose Logging: Capture 'After' State ---
+                    if cfg_args.get("verbose", False):
+                        cond_mean_after = torch.mean(noise_pred_cond).item()
+                        cond_sum_after = torch.sum(noise_pred_cond).item()
+                        uncond_mean_after = torch.mean(noise_pred_uncond_scaled).item()
+                        uncond_sum_after = torch.sum(noise_pred_uncond_scaled).item()
+
+                        log.info(f"After:  cond_mean={cond_mean_after:.4f}, uncond_mean={uncond_mean_after:.4f}")
+                        log.info(f"        cond_sum={cond_sum_after:.4f}, uncond_sum={uncond_sum_after:.4f}")
 
                 # RAAG (RATIO-aware Adaptive Guidance)
                 if raag_alpha > 0.0:
                     cfg_scale = get_raag_guidance(noise_pred_cond, noise_pred_uncond_scaled, cfg_scale, raag_alpha)
                     log.info(f"RAAG modified cfg: {cfg_scale}")
 
-                #https://github.com/WikiChao/FreSca
+                # https://github.com/WikiChao/FreSca
                 if use_fresca:
                     filtered_cond = fourier_filter(
                         noise_pred_cond - noise_pred_uncond,
@@ -2940,7 +3159,28 @@ class WanVideoSampler:
                     )
                     noise_pred = noise_pred_uncond_scaled + cfg_scale * filtered_cond * alpha
                 else:
+                    # Final CFG formula for all modes
                     noise_pred = noise_pred_uncond_scaled + cfg_scale * (noise_pred_cond - noise_pred_uncond_scaled)
+
+                # Apply SSDT Dynamic Thresholding AFTER final CFG
+                if use_cfg_advanced and cfg_args.get("mode") == "SSDT-CFG":
+                    threshold_percentile = cfg_args.get("threshold_percentile")
+
+                    if cfg_args.get("verbose", False):
+                        noise_pred_mean_before = torch.mean(noise_pred).item()
+                        noise_pred_sum_before = torch.sum(noise_pred).item()
+                        log.info(f"--- SSDT Dynamic Thresholding (percentile={threshold_percentile:.3f}) [Step {idx}] ---")
+                        log.info(f"Before: noise_pred_mean={noise_pred_mean_before:.4f}, noise_pred_sum={noise_pred_sum_before:.4f}")
+
+                    noise_pred = apply_ssdt_dynamic_thresholding(
+                        noise_pred=noise_pred,
+                        percentile=threshold_percentile
+                    )
+
+                    if cfg_args.get("verbose", False):
+                        noise_pred_mean_after = torch.mean(noise_pred).item()
+                        noise_pred_sum_after = torch.sum(noise_pred).item()
+                        log.info(f"After:  noise_pred_mean={noise_pred_mean_after:.4f}, noise_pred_sum={noise_pred_sum_after:.4f}")
                 del noise_pred_uncond_scaled, noise_pred_cond, noise_pred_uncond
                 
 
@@ -4319,6 +4559,23 @@ class WanVideoEncode:
  
         return ({"samples": latents, "noise_mask": mask},)
 
+class WanVideoSchedulerList: 
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                "scheduler": (scheduler_list, {"default": "unipc"}),
+            },
+        }
+
+    RETURN_TYPES = (scheduler_list, )
+    RETURN_NAMES = ("scheduler",)
+    FUNCTION = "process"
+    CATEGORY = "WanVideoWrapper"
+    EXPERIMENTAL = True
+
+    def process(self, scheduler):
+        return (scheduler,)
+
 NODE_CLASS_MAPPINGS = {
     "WanVideoSampler": WanVideoSampler,
     "WanVideoDecode": WanVideoDecode,
@@ -4354,6 +4611,8 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoAddMTVMotion": WanVideoAddMTVMotion,
     "WanVideoRoPEFunction": WanVideoRoPEFunction,
     "WanVideoAddPusaNoise": WanVideoAddPusaNoise
+    "WanVideoSchedulerList": WanVideoSchedulerList,
+    "WanVideoSchedulerPlotSettings": WanVideoSchedulerPlotSettings,
     }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoSampler": "WanVideo Sampler",
@@ -4390,4 +4649,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoAddMTVMotion": "WanVideo MTV Crafter Motion",
     "WanVideoRoPEFunction": "WanVideo RoPE Function",
     "WanVideoAddPusaNoise": "WanVideo Add Pusa Noise",
+    "WanVideoScheduler": "WanVideo Scheduler (BETA)",
+    "WanVideoSchedulerPlotSettings": "WanVideo Scheduler Plot Settings (BETA)",
+    "WanVideoSchedulerList": "WanVideo Scheduler Selector",
 }
