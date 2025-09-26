@@ -608,7 +608,7 @@ class WanVideoPowerLoraLoader:
         }
 
     RETURN_TYPES = ("WANVIDLORA", "WANVIDLORA")
-    RETURN_NAMES = ("lora", "lora_low")
+    RETURN_NAMES = ("selected_lora", "low_lora")
     FUNCTION = "load_loras"
     CATEGORY = "WanVideoWrapper"
     DESCRIPTION = "A powerful, flexible node to load multiple WanVideo loras with rgthree-style UI"

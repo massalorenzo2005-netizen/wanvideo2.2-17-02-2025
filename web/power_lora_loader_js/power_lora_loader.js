@@ -92,7 +92,7 @@ export function drawNumberWidgetPart(ctx, options) {
     if (options.direction === -1) {
         posX = posX - arrowWidth - innerMargin - numberWidth - innerMargin - arrowWidth;
     }
-    ctx.fill(new Path2D(`M ${posX} ${midY} l ${arrowWidth} ${arrowHeight / 2} l 0 -${arrowHeight} L ${posX} ${midY} z`));
+    // ctx.fill(new Path2D(`M ${posX} ${midY} l ${arrowWidth} ${arrowHeight / 2} l 0 -${arrowHeight} L ${posX} ${midY} z`));
     xBoundsArrowLess[0] = posX;
     xBoundsArrowLess[1] = arrowWidth;
     posX += arrowWidth + innerMargin;
@@ -107,7 +107,7 @@ export function drawNumberWidgetPart(ctx, options) {
     xBoundsNumber[0] = posX;
     xBoundsNumber[1] = numberWidth;
     posX += numberWidth + innerMargin;
-    ctx.fill(new Path2D(`M ${posX} ${midY - arrowHeight / 2} l ${arrowWidth} ${arrowHeight / 2} l -${arrowWidth} ${arrowHeight / 2} v -${arrowHeight} z`));
+    // ctx.fill(new Path2D(`M ${posX} ${midY - arrowHeight / 2} l ${arrowWidth} ${arrowHeight / 2} l -${arrowWidth} ${arrowHeight / 2} v -${arrowHeight} z`));
     xBoundsArrowMore[0] = posX;
     xBoundsArrowMore[1] = arrowWidth;
     ctx.restore();
@@ -431,12 +431,15 @@ const PROP_LABEL_SHOW_STRENGTHS = "Show Strengths";
 const PROP_VALUE_SHOW_STRENGTHS_SINGLE = "Single Strength";
 const PROP_VALUE_SHOW_STRENGTHS_SEPARATE = "Separate Model & Clip";
 
+const MINIMUM_NODE_WIDTH = 380;
+
 const DEFAULT_LORA_WIDGET_DATA = {
     on: true,
     lora: null,
     strength: 1,
     strengthTwo: null,
     is_low: false,
+    low_strength: 1,
 };
 
 // === HEADER WIDGET FROM RGTHREE ===
@@ -450,7 +453,11 @@ class OptionsWidget extends RgthreeBaseWidget {
         this.hitAreas = {
             low_mem_toggle: { bounds: [0, 0] },
             merge_loras_toggle: { bounds: [0, 0] },
+            high_to_low_button: { bounds: [0, 0] },
+            low_to_high_button: { bounds: [0, 0] },
         };
+        this.highToLowPressed = false;
+        this.lowToHighPressed = false;
     }
 
     serializeValue(node, index) {
@@ -463,11 +470,21 @@ class OptionsWidget extends RgthreeBaseWidget {
     }
 
     draw(ctx, node, w, posY, height) {
-        const margin = 10;
+        // Constants
+        const margin = 20;
         const innerMargin = margin * 0.33;
+        const buttonWidth = 25;
+        const buttonHeight = height;
+        const buttonSpacing = 20;
+        const rightOffset = 48;
+
+        // Calculated values
         const midY = posY + height * 0.5;
+        const totalButtonsWidth = (buttonWidth * 2) + buttonSpacing;
+        const rightX = w - margin - totalButtonsWidth - rightOffset;
         let posX = 10;
 
+        // Widget state
         const lowMemValue = node.properties['low_mem_load'] || false;
         const mergeValue = node.properties['merge_loras'] === false ? false : true;
 
@@ -500,10 +517,98 @@ class OptionsWidget extends RgthreeBaseWidget {
             node.setDirtyCanvas(true, true);
             return true;
         };
-        
+
+        // Draw ">" button (high to low)
+        const highToLowX = rightX;
+        drawWidgetButton(ctx, {
+            size: [buttonWidth, buttonHeight],
+            pos: [highToLowX, posY]
+        }, null, this.highToLowPressed);
+
+        ctx.save();
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillStyle = LiteGraph.WIDGET_TEXT_COLOR;
+        ctx.fillText(">", highToLowX + buttonWidth / 2, posY + buttonHeight / 2);
+        ctx.restore();
+
+        this.hitAreas['high_to_low_button'].bounds = [highToLowX, buttonWidth];
+        this.hitAreas['high_to_low_button'].onDown = () => {
+            this.highToLowPressed = true;
+            node.setDirtyCanvas(true, true);
+            return true;
+        };
+        this.hitAreas['high_to_low_button'].onUp = () => {
+            this.highToLowPressed = false;
+            node.setDirtyCanvas(true, true);
+            return true;
+        };
+        this.hitAreas['high_to_low_button'].onClick = () => {
+            this.copyHighToLowStrengths(node);
+            this.cancelMouseDown();
+            node.setDirtyCanvas(true, true);
+            return true;
+        };
+
+        // Draw "<" button (low to high)
+        const lowToHighX = rightX + buttonWidth + buttonSpacing;
+        drawWidgetButton(ctx, {
+            size: [buttonWidth, buttonHeight],
+            pos: [lowToHighX, posY]
+        }, null, this.lowToHighPressed);
+
+        ctx.save();
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillStyle = LiteGraph.WIDGET_TEXT_COLOR;
+        ctx.fillText("<", lowToHighX + buttonWidth / 2, posY + buttonHeight / 2);
+        ctx.restore();
+
+        this.hitAreas['low_to_high_button'].bounds = [lowToHighX, buttonWidth];
+        this.hitAreas['low_to_high_button'].onDown = () => {
+            this.lowToHighPressed = true;
+            node.setDirtyCanvas(true, true);
+            return true;
+        };
+        this.hitAreas['low_to_high_button'].onUp = () => {
+            this.lowToHighPressed = false;
+            node.setDirtyCanvas(true, true);
+            return true;
+        };
+        this.hitAreas['low_to_high_button'].onClick = () => {
+            this.copyLowToHighStrengths(node);
+            this.cancelMouseDown();
+            node.setDirtyCanvas(true, true);
+            return true;
+        };
+
         ctx.restore();
     }
     
+    copyHighToLowStrengths(node) {
+        // Copy high strength values to low strength values (> button)
+        for (const widget of node.widgets || []) {
+            if (widget.name?.startsWith("lora_") && widget.value) {
+                widget.value.low_strength = widget.value.strength || 1;
+            }
+        }
+        console.log('[JS] Copied all high strengths to low strengths (H -> L)');
+    }
+
+    copyLowToHighStrengths(node) {
+        // Copy low strength values to high strength values (< button)
+        for (const widget of node.widgets || []) {
+            if (widget.name?.startsWith("lora_") && widget.value) {
+                widget.value.strength = widget.value.low_strength || 1;
+                // Also update strengthTwo if in model/clip mode
+                if (widget.showModelAndClip && widget.value.strengthTwo !== undefined) {
+                    widget.value.strengthTwo = widget.value.low_strength || 1;
+                }
+            }
+        }
+        console.log('[JS] Copied all low strengths to high strengths (L -> H)');
+    }
+
     computeSize(width) {
         return [width, LiteGraph.NODE_WIDGET_HEIGHT];
     }
@@ -546,13 +651,18 @@ class PowerLoraLoaderHeaderWidget extends RgthreeBaseWidget {
             ctx.textAlign = "center";
 
             const lowLabelWidth = 30;
-            ctx.fillText("Low", rposX - lowLabelWidth / 2, midY);
+            ctx.fillText("*", rposX - lowLabelWidth / 2, midY);
             rposX -= lowLabelWidth;
 
-            ctx.fillText(this.showModelAndClip ? "Clip" : "Strength", rposX - drawNumberWidgetPart.WIDTH_TOTAL / 2, midY);
+            // Always show L label for low strength slider
+            ctx.fillText("Low", rposX - drawNumberWidgetPart.WIDTH_TOTAL / 2, midY);
+            rposX = rposX - drawNumberWidgetPart.WIDTH_TOTAL - 2;
+
+            // Always show H label for main strength slider
+            ctx.fillText("High", rposX - drawNumberWidgetPart.WIDTH_TOTAL / 2, midY);
             if (this.showModelAndClip) {
-                rposX = rposX - drawNumberWidgetPart.WIDTH_TOTAL - innerMargin * 2;
-                ctx.fillText("Model", rposX - drawNumberWidgetPart.WIDTH_TOTAL / 2, midY);
+                rposX = rposX - drawNumberWidgetPart.WIDTH_TOTAL - 2;
+                ctx.fillText("High", rposX - drawNumberWidgetPart.WIDTH_TOTAL / 2, midY);
             }
         }
         ctx.restore();
@@ -582,12 +692,17 @@ class PowerLoraLoaderWidget extends RgthreeBaseWidget {
             strengthTwoVal: { bounds: [0, 0], onClick: this.onStrengthTwoValUp },
             strengthTwoInc: { bounds: [0, 0], onClick: this.onStrengthTwoIncDown },
             strengthTwoAny: { bounds: [0, 0], onMove: this.onStrengthTwoAnyMove },
+            lowStrengthDec: { bounds: [0, 0], onClick: this.onLowStrengthDecDown },
+            lowStrengthVal: { bounds: [0, 0], onClick: this.onLowStrengthValUp },
+            lowStrengthInc: { bounds: [0, 0], onClick: this.onLowStrengthIncDown },
+            lowStrengthAny: { bounds: [0, 0], onMove: this.onLowStrengthAnyMove },
         };
         this._value = {
             on: true,
             lora: null,
             strength: 1,
             strengthTwo: null,
+            low_strength: 1,
         };
     }
 
@@ -598,6 +713,10 @@ class PowerLoraLoaderWidget extends RgthreeBaseWidget {
             if (this.showModelAndClip) {
                 this._value.strengthTwo = this._value.strength;
             }
+        }
+        // Ensure low_strength is always initialized
+        if (this._value.low_strength === undefined) {
+            this._value.low_strength = 1;
         }
     }
 
@@ -753,6 +872,23 @@ class PowerLoraLoaderWidget extends RgthreeBaseWidget {
         ctx.fillStyle = oldFillStyle;
         rposX -= iconWidth;
 
+        // Draw low strength slider (L)
+        const lowStrengthValue = this.value.low_strength || 1;
+        const [lowLeftArrow, lowText, lowRightArrow] = drawNumberWidgetPart(ctx, {
+            posX: rposX,
+            posY,
+            height,
+            value: lowStrengthValue,
+            direction: -1,
+        });
+
+        this.hitAreas.lowStrengthDec.bounds = lowLeftArrow;
+        this.hitAreas.lowStrengthVal.bounds = lowText;
+        this.hitAreas.lowStrengthInc.bounds = lowRightArrow;
+        this.hitAreas.lowStrengthAny.bounds = [lowLeftArrow[0], lowRightArrow[0] + lowRightArrow[1] - lowLeftArrow[0]];
+        rposX = lowLeftArrow[0] - 2;
+
+        // Draw main strength slider (H)
         const strengthValue = this.showModelAndClip
             ? ((_c = this.value.strengthTwo) !== null && _c !== void 0 ? _c : 1)
             : ((_d = this.value.strength) !== null && _d !== void 0 ? _d : 1);
@@ -769,10 +905,10 @@ class PowerLoraLoaderWidget extends RgthreeBaseWidget {
         this.hitAreas.strengthVal.bounds = text;
         this.hitAreas.strengthInc.bounds = rightArrow;
         this.hitAreas.strengthAny.bounds = [leftArrow[0], rightArrow[0] + rightArrow[1] - leftArrow[0]];
-        rposX = leftArrow[0] - innerMargin;
+        rposX = leftArrow[0] - 2;
 
         if (this.showModelAndClip) {
-            rposX -= innerMargin;
+            rposX -= 2;
             this.hitAreas.strengthTwoDec.bounds = this.hitAreas.strengthDec.bounds;
             this.hitAreas.strengthTwoVal.bounds = this.hitAreas.strengthVal.bounds;
             this.hitAreas.strengthTwoInc.bounds = this.hitAreas.strengthInc.bounds;
@@ -793,7 +929,7 @@ class PowerLoraLoaderWidget extends RgthreeBaseWidget {
                 leftArrow[0],
                 rightArrow[0] + rightArrow[1] - leftArrow[0],
             ];
-            rposX = leftArrow[0] - innerMargin;
+            rposX = leftArrow[0] - 2;
         }
 
         const loraWidth = rposX - posX;
@@ -810,6 +946,8 @@ class PowerLoraLoaderWidget extends RgthreeBaseWidget {
     serializeValue(node, index) {
         var _b;
         const v = { ...this.value };
+
+        // Handle model/clip strength modes
         if (!this.showModelAndClip) {
             delete v.strengthTwo;
         }
@@ -818,8 +956,40 @@ class PowerLoraLoaderWidget extends RgthreeBaseWidget {
             v.strengthTwo = this.value.strengthTwo;
         }
 
-        // Debug logging
-        console.log(`[JS] serializeValue for ${this.name}: `, v);
+        // Ensure low_strength is always included
+        if (v.low_strength === undefined) {
+            v.low_strength = 1;
+        }
+
+        // CRITICAL: When using low variant, swap the lora and strength values
+        if (v.is_low && v.low_variant_name) {
+            console.log(`[JS] Using low variant: switching from ${v.lora} (strength: ${v.strength}) to ${v.low_variant_name} (strength: ${v.low_strength})`);
+
+            // Store original values for debugging
+            const originalLora = v.lora;
+            const originalStrength = v.strength;
+
+            // Use low variant name and low strength
+            v.lora = v.low_variant_name;
+            v.strength = v.low_strength;
+
+            // If in model/clip mode, also update strengthTwo
+            if (this.showModelAndClip && v.strengthTwo !== undefined) {
+                v.strengthTwo = v.low_strength;
+            }
+
+            console.log(`[JS] Swapped values: ${originalLora} -> ${v.lora}, strength: ${originalStrength} -> ${v.strength}`);
+        }
+
+        // Enhanced debug logging
+        console.log(`[JS] serializeValue for ${this.name}:`, {
+            final_lora: v.lora,
+            final_strength: v.strength,
+            original_low_strength: v.low_strength,
+            is_low: v.is_low,
+            low_variant_name: v.low_variant_name,
+            full_object: v
+        });
 
         return v;
     }
@@ -877,6 +1047,22 @@ class PowerLoraLoaderWidget extends RgthreeBaseWidget {
         this.doOnStrengthAnyMove(event, true);
     }
 
+    onLowStrengthDecDown(event, pos, node) {
+        this.stepLowStrength(-1);
+    }
+
+    onLowStrengthIncDown(event, pos, node) {
+        this.stepLowStrength(1);
+    }
+
+    onLowStrengthAnyMove(event, pos, node) {
+        this.doOnLowStrengthAnyMove(event);
+    }
+
+    onLowStrengthValUp(event, pos, node) {
+        this.doOnLowStrengthValUp(event);
+    }
+
     doOnStrengthAnyMove(event, isTwo = false) {
         var _b;
         if (event.deltaX) {
@@ -915,6 +1101,28 @@ class PowerLoraLoaderWidget extends RgthreeBaseWidget {
         this.value[prop] = Math.round(strength * 100) / 100;
     }
 
+    doOnLowStrengthAnyMove(event) {
+        var _b;
+        if (event.deltaX) {
+            this.haveMouseMovedStrength = true;
+            this.value.low_strength = ((_b = this.value.low_strength) !== null && _b !== void 0 ? _b : 1) + event.deltaX * 0.05;
+        }
+    }
+
+    doOnLowStrengthValUp(event) {
+        if (this.haveMouseMovedStrength)
+            return;
+        const canvas = app.canvas;
+        canvas.prompt("Value", this.value.low_strength, (v) => (this.value.low_strength = Number(v)), event);
+    }
+
+    stepLowStrength(direction) {
+        var _b;
+        let step = 0.05;
+        let strength = ((_b = this.value.low_strength) !== null && _b !== void 0 ? _b : 1) + step * direction;
+        this.value.low_strength = Math.round(strength * 100) / 100;
+    }
+
     showLoraInfoDialog() {
         if (!this.value.lora || this.value.lora === "None") {
             return;
@@ -947,7 +1155,7 @@ Clip Strength: ${this.value.strengthTwo}` : ""}`;
 // === MAIN NODE EXTENSION ===
 // Based exactly on rgthree's registration pattern
 class WanVideePowerLoraLoader {
-    constructor(title = "WanVideo Power Lora Loader") {
+    constructor(title = "Wan Video Power Lora Loader") {
         this.serialize_widgets = true;
         this.loraWidgetsCounter = 0;
         this.properties = {};
@@ -1015,7 +1223,7 @@ class WanVideePowerLoraLoader {
     }
 }
 
-WanVideePowerLoraLoader.title = "WanVideo Power Lora Loader";
+WanVideePowerLoraLoader.title = "Wan Video Power Lora Loader";
 WanVideePowerLoraLoader.type = "WanVideoPowerLoraLoader";
 WanVideePowerLoraLoader.comfyClass = "WanVideoPowerLoraLoader";
 
@@ -1050,7 +1258,22 @@ app.registerExtension({
                 for (const widgetValue of info.widgets_values || []) {
                     if (widgetValue?.lora !== undefined) {
                         const widget = this.addNewLoraWidget();
-                        widget.value = { ...widgetValue };
+
+                        // Ensure low_strength is preserved during restore
+                        const restoredValue = { ...widgetValue };
+                        if (restoredValue.low_strength === undefined) {
+                            restoredValue.low_strength = 1;
+                        }
+
+                        console.log(`[JS] Restoring widget with value:`, {
+                            lora: restoredValue.lora,
+                            strength: restoredValue.strength,
+                            low_strength: restoredValue.low_strength,
+                            is_low: restoredValue.is_low,
+                            full_object: restoredValue
+                        });
+
+                        widget.value = restoredValue;
                     }
                 }
 
@@ -1105,7 +1328,7 @@ app.registerExtension({
 
                 const computed = this.computeSize();
                 this.size = this.size || [0, 0];
-                this.size[0] = Math.max(this.size[0], computed[0]);
+                this.size[0] = Math.max(MINIMUM_NODE_WIDTH, this.size[0], computed[0]);
                 this.size[1] = Math.max(this.size[1], computed[1]);
                 this.setDirtyCanvas(true, true);
 
@@ -1273,12 +1496,20 @@ app.registerExtension({
                 // Fetch fresh loras and update cache
                 getWanVideoLoras().then((lorasDetails) => {
                     this.lorasCache = lorasDetails.map((l) => l.file);
+                    console.log(`[WanVideoPowerLoraLoader] Refreshed LoRA cache with ${this.lorasCache.length} items`);
+
+                    // Update any existing widgets that might need the fresh data
+                    for (const widget of this.widgets || []) {
+                        if (widget.name?.startsWith("lora_")) {
+                            // Update the widget's parent reference to this node
                             widget.parent = this;
 
                             // Refresh low variant detection for existing LoRAs with new cache
                             if (widget.value?.lora && widget.value.lora !== "None") {
                                 const oldIsLow = widget.value.is_low;
                                 const oldVariantName = widget.value.low_variant_name;
+
+                                // Re-run the low variant check with updated cache
                                 widget.checkLowLoraVariant(widget.value.lora);
 
                                 // Log changes in low variant detection
