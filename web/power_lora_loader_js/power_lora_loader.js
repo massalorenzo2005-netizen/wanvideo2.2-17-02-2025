@@ -1264,6 +1264,41 @@ app.registerExtension({
                 this.setDirtyCanvas(true, true);
             };
 
+            // Add refreshComboInNode method to handle R key press for reloading definitions
+            nodeType.prototype.refreshComboInNode = function(defs) {
+                console.log('[WanVideoPowerLoraLoader] Refreshing LoRA cache due to R key press');
+                // Clear the cache and force refresh
+                this.lorasCache = [];
+
+                // Fetch fresh loras and update cache
+                getWanVideoLoras().then((lorasDetails) => {
+                    this.lorasCache = lorasDetails.map((l) => l.file);
+                            widget.parent = this;
+
+                            // Refresh low variant detection for existing LoRAs with new cache
+                            if (widget.value?.lora && widget.value.lora !== "None") {
+                                const oldIsLow = widget.value.is_low;
+                                const oldVariantName = widget.value.low_variant_name;
+                                widget.checkLowLoraVariant(widget.value.lora);
+
+                                // Log changes in low variant detection
+                                if (oldIsLow !== widget.value.is_low || oldVariantName !== widget.value.low_variant_name) {
+                                    console.log(`[WanVideoPowerLoraLoader] Low variant status changed for '${widget.value.lora}': ` +
+                                              `${oldIsLow} -> ${widget.value.is_low}, ` +
+                                              `variant: '${oldVariantName}' -> '${widget.value.low_variant_name}'`);
+                                }
+                            }
+                        }
+                    }
+
+                    // Trigger a redraw to update the green low icons
+                    this.setDirtyCanvas(true, true);
+                    console.log('[WanVideoPowerLoraLoader] Low variant detection refreshed for all widgets');
+                }).catch(error => {
+                    console.error('[WanVideoPowerLoraLoader] Error refreshing LoRA cache:', error);
+                });
+            };
+
             // Set up properties for the node class
             nodeType[`@${PROP_LABEL_SHOW_STRENGTHS}`] = {
                 type: "combo",
