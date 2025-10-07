@@ -9,3 +9,4 @@ pyloudnorm
 gguf>=0.17.1
 opencv-python
 scipy
+librosa
