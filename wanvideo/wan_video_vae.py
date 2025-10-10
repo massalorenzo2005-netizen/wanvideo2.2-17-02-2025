@@ -969,7 +969,7 @@ class VideoVAE_(nn.Module):
 
 
     #modification originally by @raindrop313 https://github.com/raindrop313/ComfyUI-WanVideoStartEndFrames
-    def encode_2(self, x, pbar=True):
+    def encode_2(self, x, pbar=True, sample=False):
         t = x.shape[2]
         iter_ = 2 + (t - 2) // 4
 
