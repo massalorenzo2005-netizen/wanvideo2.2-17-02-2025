@@ -2015,7 +2015,10 @@ class WanVideoDecode:
 
         if type(vae).__name__ == "TAEHV":
             # FlashVSR decoding with chunking for memory efficiency
-            if context_options is not None and latents.shape[2] > context_options["context_frames"]:
+            # Convert context_frames from pixel to latent space for comparison
+            latent_context_frames_threshold = max(1, context_options["context_frames"] // 4) if context_options is not None else 999999
+                                                  
+            if context_options is not None and latents.shape[2] > latent_context_frames_threshold:
                 # Chunk the decoding with overlap for temporal continuity
                 context_frames = context_options["context_frames"]
                 context_overlap = context_options.get("context_overlap", 16)
