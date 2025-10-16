@@ -1654,7 +1654,7 @@ class WanVideoContextOptions:
             "verbose": ("BOOLEAN", {"default": False, "tooltip": "Print debug output"}),
             },
             "optional": {
-                "fuse_method": (["linear", "pyramid"], {"default": "linear", "tooltip": "Window weight function: linear=ramps at edges only, pyramid=triangular weights peaking in middle"}),
+                "fuse_method": (["linear", "pyramid", "flashvsr"], {"default": "linear", "tooltip": "Window weight function: linear=ramps at edges only, pyramid=triangular weights peaking in middle, flashvsr=no blending (use for FlashVSR upscaling)"}),
                 "reference_latent": ("LATENT", {"tooltip": "Image to be used as init for I2V models for windows where first frame is not the actual first frame. Mostly useful with MAGREF model"}),
             }
         }
@@ -1999,6 +1999,9 @@ class WanVideoDecode:
 
         flashvsr_LQ_images = samples.get("flashvsr_LQ_images", None)
 
+        # Get context_options from samples dictionary (passed from WanVideoSampler)
+        context_options = samples.get("context_options", None)
+
         vae.to(device)
 
         latents = latents.to(device = device, dtype = vae.dtype)
@@ -2010,11 +2013,101 @@ class WanVideoDecode:
         if drop_last:
             latents = latents[:, :, :-1]
 
-        if type(vae).__name__ == "TAEHV":      
-            images = vae.decode_video(latents.permute(0, 2, 1, 3, 4), cond=flashvsr_LQ_images.to(vae.dtype))[0].permute(1, 0, 2, 3)
-            images = torch.clamp(images, 0.0, 1.0)
-            images = images.permute(1, 2, 3, 0).cpu().float()
-            return (images,)
+        if type(vae).__name__ == "TAEHV":
+            # FlashVSR decoding with chunking for memory efficiency
+            if context_options is not None and latents.shape[2] > context_options["context_frames"]:
+                # Chunk the decoding with overlap for temporal continuity
+                context_frames = context_options["context_frames"]
+                context_overlap = context_options.get("context_overlap", 16)
+                num_frames = latents.shape[2]
+
+                # Work in latent space for chunking
+                latent_context_frames = max(1, context_frames // 4)
+                latent_overlap = max(1, context_overlap // 4)
+                stride = latent_context_frames - latent_overlap
+
+                # FlashVSR decoder outputs at PIXEL temporal resolution (4x latent)
+                # So we need to discard overlap in pixel space
+                pixel_overlap = context_overlap
+
+                log.info(f"Decoding FlashVSR with overlap: {latent_context_frames} latent frames per chunk, {latent_overlap} latent overlap ({pixel_overlap} pixel overlap), {num_frames} total latent frames")
+
+                decoded_frames = []
+
+                # Process chunks with overlap, but trim the overlap
+                for chunk_idx, start_idx in enumerate(range(0, num_frames, stride)):
+                    end_idx = min(start_idx + latent_context_frames, num_frames)
+
+                    # Extract latent chunk
+                    chunk_latents = latents[:, :, start_idx:end_idx]
+
+                    # Extract corresponding LQ images if they exist
+                    chunk_LQ = None
+                    if flashvsr_LQ_images is not None:
+                        lq_start = start_idx * 4
+                        lq_end = end_idx * 4
+                        chunk_LQ = flashvsr_LQ_images[:, :, lq_start:lq_end].to(vae.dtype)
+
+                    # Decode this chunk with sequential processing
+                    # Output is at PIXEL temporal resolution (not latent!)
+                    chunk_images = vae.decode_video(
+                        chunk_latents.permute(0, 2, 1, 3, 4),
+                        cond=chunk_LQ,
+                        parallel=False,  # Frame-by-frame within chunk
+                        show_progress_bar=True
+                    )[0].permute(1, 0, 2, 3)
+
+                    # Keep only non-overlapping frames (discard in PIXEL space)
+                    if chunk_idx == 0:
+                        # First chunk: keep all frames
+                        keep_frames = chunk_images
+                    else:
+                        # Calculate actual overlap based on decoder output
+                        # Decoder doesn't always output exactly 4x latent frames
+                        actual_pixel_frames = chunk_images.shape[1]
+                        overlap_ratio = latent_overlap / latent_context_frames
+                        actual_overlap = int(actual_pixel_frames * overlap_ratio)
+
+                        # Discard the overlap frames
+                        if chunk_images.shape[1] > actual_overlap:
+                            keep_frames = chunk_images[:, actual_overlap:]
+                        else:
+                            keep_frames = chunk_images
+
+                    decoded_frames.append(keep_frames.cpu())
+
+                    # Log before cleanup
+                    if chunk_idx == 0:
+                        log.info(f"Decoded chunk {start_idx}-{end_idx} latent ({start_idx*4}-{end_idx*4} pixel), decoder output {chunk_images.shape[1]} frames, kept all")
+                    else:
+                        log.info(f"Decoded chunk {start_idx}-{end_idx} latent ({start_idx*4}-{end_idx*4} pixel), decoder output {chunk_images.shape[1]} frames, discarded {actual_overlap}, kept {decoded_frames[-1].shape[1]}")
+
+                    # Clean up
+                    del chunk_latents, chunk_images, keep_frames
+                    if chunk_LQ is not None:
+                        del chunk_LQ
+                    mm.soft_empty_cache()
+
+                # Concatenate all chunks
+                images = torch.cat(decoded_frames, dim=1)
+                images = torch.clamp(images, 0.0, 1.0)
+                images = images.permute(1, 2, 3, 0).float()
+
+                del decoded_frames
+                mm.soft_empty_cache()
+
+                return (images,)
+            else:
+                # Single-pass decoding for short videos
+                images = vae.decode_video(
+                    latents.permute(0, 2, 1, 3, 4),
+                    cond=flashvsr_LQ_images.to(vae.dtype) if flashvsr_LQ_images is not None else None,
+                    parallel=True
+                )[0].permute(1, 0, 2, 3)
+
+                images = torch.clamp(images, 0.0, 1.0)
+                images = images.permute(1, 2, 3, 0).cpu().float()
+                return (images,)
         else:
             if end_image is not None:
                 enable_vae_tiling = False

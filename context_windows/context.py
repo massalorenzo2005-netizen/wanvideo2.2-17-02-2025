@@ -186,8 +186,18 @@ def get_total_steps(
 
 def create_window_mask(noise_pred_context, c, latent_video_length, context_overlap, looped=False, window_type="linear"):
     window_mask = torch.ones_like(noise_pred_context)
-    
-    if window_type == "pyramid":
+
+    if window_type == "flashvsr":
+        # Special mode for FlashVSR: use overlap for context but don't blend
+        # First chunk: keep all frames (weight=1)
+        # Later chunks: mask out overlap region (weight=0), keep only new frames (weight=1)
+        if min(c) > 0:  # Not the first chunk
+            # Set overlap region to 0 so these frames don't contribute to final result
+            window_mask[:, :context_overlap] = 0
+        # All other frames get weight 1 (no blending/ramping)
+        return window_mask
+
+    elif window_type == "pyramid":
         # Create pyramid weights that peak in the middle
         length = noise_pred_context.shape[1]
         if length % 2 == 0:
