@@ -1,5 +1,7 @@
 # ComfyUI wrapper nodes for [WanVideo](https://github.com/Wan-Video/Wan2.1) and related models.
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/kijai/ComfyUI-WanVideoWrapper)
+
 # WORK IN PROGRESS (perpetually)
 
 # Why should I use custom nodes when WanVideo works natively?
