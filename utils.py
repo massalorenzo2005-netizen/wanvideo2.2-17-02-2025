@@ -506,6 +506,11 @@ def compile_model(transformer, compile_args=None):
         torch._dynamo.config.cache_size_limit = compile_args["dynamo_cache_size_limit"]
         torch._dynamo.config.force_parameter_static_shapes = compile_args["force_parameter_static_shapes"]
         try:
+            if hasattr(torch._dynamo.config, 'allow_unspec_int_on_nn_module'):
+                torch._dynamo.config.allow_unspec_int_on_nn_module = True
+        except Exception as e:
+            log.warning(f"Could not set allow_unspec_int_on_nn_module: {e}")
+        try:
             torch._dynamo.config.recompile_limit = compile_args["dynamo_recompile_limit"]
         except Exception as e:
             log.warning(f"Could not set recompile_limit: {e}")

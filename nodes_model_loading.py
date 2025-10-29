@@ -131,6 +131,7 @@ def standardize_lora_key_format(lora_sd):
         if k.startswith('vace_blocks.'):
             k = k.replace('vace_blocks.', 'diffusion_model.vace_blocks.')
         k = k.replace('.default.', '.')
+        k = k.replace('.diff_m', '.modulation.diff')
 
         # Fun LoRA format
         if k.startswith('lora_unet__'):
@@ -328,7 +329,7 @@ class WanVideoTorchCompileSettings:
             },
             "optional": {
                 "dynamo_recompile_limit": ("INT", {"default": 128, "min": 0, "max": 1024, "step": 1, "tooltip": "torch._dynamo.config.recompile_limit"}),
-                "force_parameter_static_shapes": ("BOOLEAN", {"default": True, "tooltip": "torch._dynamo.config.force_parameter_static_shapes"}),
+                "force_parameter_static_shapes": ("BOOLEAN", {"default": False, "tooltip": "torch._dynamo.config.force_parameter_static_shapes"}),
             },
         }
     RETURN_TYPES = ("WANCOMPILEARGS",)
@@ -1668,10 +1669,17 @@ class WanVideoVAELoader:
         if not has_model_prefix:
             vae_sd = {f"model.{k}": v for k, v in vae_sd.items()}
 
+        dim = vae_sd["model.decoder.conv1.bias"].shape[0]
+        if dim == 96:
+            log.info("Detected lightVAE model with 75% pruning")
+            pruning_rate = 0.75
+        else:
+            pruning_rate = 0.0
+
         if vae_sd["model.conv2.weight"].shape[0] == 16:
-            vae = WanVideoVAE(dtype=dtype)
+            vae = WanVideoVAE(dtype=dtype, pruning_rate=pruning_rate)
         elif vae_sd["model.conv2.weight"].shape[0] == 48:
-            vae = WanVideoVAE38(dtype=dtype)
+            vae = WanVideoVAE38(dtype=dtype, pruning_rate=pruning_rate)
 
         vae.load_state_dict(vae_sd)
         del vae_sd
