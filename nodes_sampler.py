@@ -1919,18 +1919,7 @@ class WanVideoSampler:
                                 for vace_entry in vace_data:
                                     partial_context = vace_entry["context"][0][:, c]
                                     if has_ref:
-                                        if c[0] != 0 and context_reference_latent is not None:
-                                            if context_reference_latent.shape[0] == 1: #only single extra init latent
-                                                partial_context[16:32, :1] = context_reference_latent[0, :, :1].to(intermediate_device)
-                                            elif context_reference_latent.shape[0] > 1:
-                                                num_extra_inits = context_reference_latent.shape[0]
-                                                section_size = (latent_video_length / num_extra_inits)
-                                                extra_init_index = min(int(max(c) / section_size), num_extra_inits - 1)
-                                                if context_options["verbose"]:
-                                                    log.info(f"extra init image index: {extra_init_index}")
-                                                partial_context[16:32, :1] = context_reference_latent[extra_init_index, :, :1].to(intermediate_device)
-                                        else:
-                                            partial_context[:, 0] = vace_entry["context"][0][:, 0]
+                                        partial_context[:, 0] = vace_entry["context"][0][:, 0]
 
                                     window_vace_data.append({
                                         "context": [partial_context],
@@ -3135,36 +3124,10 @@ class WanVideoSampler:
             "samples": callback_latent.unsqueeze(0).cpu() if callback is not None else None,
         })
 
-class WanVideoSamplerSettings(WanVideoSampler):
-    RETURN_TYPES = ("SAMPLER_ARGS",)
-    RETURN_NAMES = ("sampler_inputs", )
-    DESCRIPTION = "Node to output all settings and inputs for the WanVideoSamplerFromSettings -node"
-    def process(self, *args, **kwargs):
-        import inspect
-        params = inspect.signature(WanVideoSampler.process).parameters
-        args_dict = {name: kwargs.get(name, param.default if param.default is not inspect.Parameter.empty else None)
-                     for name, param in params.items() if name != "self"}
-        return args_dict,
-
-class WanVideoSamplerFromSettings(WanVideoSampler):
-    DESCRIPTION = "Utility node with no other functionality than to look cleaner, useful for the live preview as the main sampler node has become a messy monster"
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "sampler_inputs": ("SAMPLER_ARGS",),},
-        }
-
-    def process(self, sampler_inputs):
-        return super().process(**sampler_inputs)
 
 NODE_CLASS_MAPPINGS = {
     "WanVideoSampler": WanVideoSampler,
-    "WanVideoSamplerSettings": WanVideoSamplerSettings,
-    "WanVideoSamplerFromSettings": WanVideoSamplerFromSettings,
     }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoSampler": "WanVideo Sampler",
-    "WanVideoSamplerSettings": "WanVideo Sampler Settings",
-    "WanVideoSamplerFromSettings": "WanVideo Sampler From Settings",
 }
