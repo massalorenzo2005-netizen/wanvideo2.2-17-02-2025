@@ -22,6 +22,30 @@ offload_device = mm.unet_offload_device()
 VAE_STRIDE = (4, 8, 8)
 PATCH_SIZE = (1, 2, 2)
 
+class WanVideoAddVideoPromptEmbeds:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                    "image_embeds": ("WANVIDIMAGE_EMBEDS",),
+                    "video_prompt_embeds": ("WANVIDIMAGE_EMBEDS",),
+                    "video_prompt_latents": ("LATENT", ),
+                    "text_embeds": ("WANVIDEOTEXTEMBEDS", ),
+                }
+        }
+
+    RETURN_TYPES = ("WANVIDIMAGE_EMBEDS",)
+    RETURN_NAMES = ("image_embeds",)
+    FUNCTION = "add"
+    CATEGORY = "WanVideoWrapper"
+    EXPERIMENTAL = True
+
+    def add(self, image_embeds, video_prompt_embeds, video_prompt_latents, text_embeds):
+        updated = dict(image_embeds)
+        updated["video_prompt_embeds"] = video_prompt_embeds
+        updated["video_prompt_embeds"]["video_prompt_latents"] = video_prompt_latents["samples"][0]
+        updated["video_prompt_embeds"]["text_embeds"] = text_embeds
+        return (updated,)
+
 
 class WanVideoEnhanceAVideo:
     @classmethod
@@ -2206,6 +2230,7 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoAnimateEmbeds": WanVideoAnimateEmbeds,
     "WanVideoAddLucyEditLatents": WanVideoAddLucyEditLatents,
     "WanVideoSchedulerSA_ODE": WanVideoSchedulerSA_ODE,
+    "WanVideoAddVideoPromptEmbeds": WanVideoAddVideoPromptEmbeds,
     }
 
 NODE_DISPLAY_NAME_MAPPINGS = {

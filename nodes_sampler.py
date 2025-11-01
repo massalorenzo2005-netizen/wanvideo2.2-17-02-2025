@@ -289,6 +289,7 @@ class WanVideoSampler:
         phantom_latents = fun_ref_image = ATI_tracks = None
         add_cond = attn_cond = attn_cond_neg = noise_pred_flipped = None
         humo_audio = humo_audio_neg = None
+        image_cond_mot_ref = None
 
         #I2V
         image_cond = image_embeds.get("image_embeds", None)
@@ -475,6 +476,22 @@ class WanVideoSampler:
                 phantom_cfg_scale = [phantom_cfg_scale] * (steps +1)
             phantom_start_percent = image_embeds.get("phantom_start_percent", 0.0)
             phantom_end_percent = image_embeds.get("phantom_end_percent", 1.0)
+
+        # Video-as-prompt (VAP)
+        mot_ref_clip_embeds = mot_ref_context = None
+        video_prompt_embeds = image_embeds.get("video_prompt_embeds", None)
+        if video_prompt_embeds is not None:
+            image_cond_mot_ref = video_prompt_embeds.get("image_embeds", None)
+            print("image_cond_mot_ref shape:", image_cond_mot_ref.shape)
+            image_cond_mask_ = video_prompt_embeds.get("mask", None)
+            if image_cond_mask_ is not None:
+                image_cond_mot_ref = torch.cat([image_cond_mask_, image_cond_mot_ref])
+            latents_mot_ref = video_prompt_embeds.get("video_prompt_latents", None)
+            print("latents_mot_ref shape:", latents_mot_ref.shape)
+            x_mot_ref = torch.cat([latents_mot_ref, image_cond_mot_ref], dim=0)
+            mot_ref_context = video_prompt_embeds.get("text_embeds", None)
+            mot_ref_clip_embeds = video_prompt_embeds.get("clip_context", None)
+            print("x_mot_ref shape:", x_mot_ref.shape)
 
         # CLIP image features
         clip_fea = image_embeds.get("clip_context", None)
@@ -1395,7 +1412,10 @@ class WanVideoSampler:
                     "ovi_negative_text_embeds": ovi_negative_text_embeds, # Audio latent model negative text embeds for Ovi
                     "flashvsr_LQ_latent": flashvsr_LQ_latent, # FlashVSR LQ latent for upsampling
                     "flashvsr_strength": flashvsr_strength, # FlashVSR strength
-                    "num_cond_latents": len(all_indices) if transformer.is_longcat else None # number of cond latents LongCat to separate attention
+                    "num_cond_latents": len(all_indices) if transformer.is_longcat else None, # number of cond latents LongCat to separate attention
+                    "x_mot_ref": [x_mot_ref.to(z)] if image_cond_mot_ref is not None else None, # motion reference latents for VAP
+                    "mot_ref_context": mot_ref_context if image_cond_mot_ref is not None else None, # motion reference context for VAP
+                    "mot_ref_clip_embeds": mot_ref_clip_embeds, # motion reference clip features for VAP
                 }
 
                 batch_size = 1

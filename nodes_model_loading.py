@@ -1346,6 +1346,7 @@ class WanVideoModelLoader:
             "lynx_ip_layers": lynx_ip_layers,
             "lynx_ref_layers": lynx_ref_layers,
             "is_longcat": dim == 4096,
+            "is_VAP": True if "patch_embedding_mot_ref.weight" in sd else False
 
         }
 
