@@ -60,7 +60,7 @@ def get_scheduler(scheduler, steps, start_step, end_step, shift, device, transfo
             if flowedit_args: #seems to work better
                 timesteps, _ = retrieve_timesteps(sample_scheduler, device=device, sigmas=get_sampling_sigmas(steps, shift))
             else:
-                sample_scheduler.set_timesteps(steps, device=device, sigmas=sigmas)
+                sample_scheduler.set_timesteps(steps, device=device, sigmas=sigmas[:-1].tolist() if sigmas is not None else None)
     elif 'dpm' in scheduler:
         if 'sde' in scheduler:
             algorithm_type = "sde-dpmsolver++"
