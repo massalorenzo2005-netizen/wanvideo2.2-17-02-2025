@@ -485,28 +485,21 @@ class WanVideoSampler:
             phantom_end_percent = image_embeds.get("phantom_end_percent", 1.0)
 
         # Video-as-prompt (VAP)
-        mot_ref_clip_embeds = mot_ref_context = None
+        mot_ref_clip_embeds = mot_ref_context = x_mot_ref = None
         video_prompt_embeds = image_embeds.get("video_prompt_embeds", None)
         if video_prompt_embeds is not None:
             image_cond_mot_ref = video_prompt_embeds.get("image_embeds", None)
-            print("image_cond_mot_ref shape:", image_cond_mot_ref.shape)
             image_cond_mask_ = video_prompt_embeds.get("mask", None)
             if image_cond_mask_ is not None:
                 image_cond_mot_ref = torch.cat([image_cond_mask_, image_cond_mot_ref])
             latents_mot_ref = video_prompt_embeds.get("video_prompt_latents", None)
-            print("latents_mot_ref shape:", latents_mot_ref.shape)
             x_mot_ref = torch.cat([latents_mot_ref, image_cond_mot_ref], dim=0)
             mot_ref_context = video_prompt_embeds.get("text_embeds", None)
             mot_ref_clip_embeds = video_prompt_embeds.get("clip_context", None)
-            print("x_mot_ref shape:", x_mot_ref.shape)
 
         # CLIP image features
         clip_fea = image_embeds.get("clip_context", None)
-        if clip_fea is not None:
-            clip_fea = clip_fea.to(dtype)
         clip_fea_neg = image_embeds.get("negative_clip_context", None)
-        if clip_fea_neg is not None:
-            clip_fea_neg = clip_fea_neg.to(dtype)
 
         num_frames = image_embeds.get("num_frames", 0)
 
@@ -1057,7 +1050,7 @@ class WanVideoSampler:
         if standin_input is not None:
             rope_function = "comfy" # only works with this currently
 
-        freqs = None
+        freqs = freqs_mot_ref = None
         transformer.rope_embedder.k = None
         transformer.rope_embedder.num_frames = None
         d = transformer.dim // transformer.num_heads
@@ -1071,15 +1064,19 @@ class WanVideoSampler:
                 rope_params_mocha(1024, d - 4 * (d // 6), L_test=latent_video_length, k=riflex_freq_index, start=-1),
                 rope_params_mocha(1024, 2 * (d // 6), start=-1),
                 rope_params_mocha(1024, 2 * (d // 6), start=-1)
-            ],
-            dim=1)
+            ], dim=1)
         elif "default" in rope_function or bidirectional_sampling: # original RoPE
             freqs = torch.cat([
                 rope_params(1024, d - 4 * (d // 6), L_test=latent_video_length, k=riflex_freq_index),
                 rope_params(1024, 2 * (d // 6)),
                 rope_params(1024, 2 * (d // 6))
-            ],
-            dim=1)
+            ], dim=1).to(device)
+            if x_mot_ref is not None:
+                freqs_mot_ref = torch.cat([
+                    rope_params(1024, d - 4 * (d // 6), L_test=latent_video_length, k=riflex_freq_index, mot_ref_latent=x_mot_ref),
+                    rope_params(1024, 2 * (d // 6)),
+                    rope_params(1024, 2 * (d // 6))
+                ], dim=1).to(device)
         elif "comfy" in rope_function: # comfy's rope
             transformer.rope_embedder.k = riflex_freq_index
             transformer.rope_embedder.num_frames = latent_video_length
@@ -1364,6 +1361,10 @@ class WanVideoSampler:
                     z = z * c_in
                     timestep = c_noise
 
+                x_mot_ref_input = None
+                if image_cond_mot_ref is not None:
+                    x_mot_ref_input = [x_mot_ref.to(z)]
+
                 base_params = {
                     'x': [z], # latent
                     'y': [image_cond_input] if image_cond_input is not None else None, # image cond
@@ -1420,9 +1421,10 @@ class WanVideoSampler:
                     "flashvsr_LQ_latent": flashvsr_LQ_latent, # FlashVSR LQ latent for upsampling
                     "flashvsr_strength": flashvsr_strength, # FlashVSR strength
                     "num_cond_latents": len(all_indices) if transformer.is_longcat else None, # number of cond latents LongCat to separate attention
-                    "x_mot_ref": [x_mot_ref.to(z)] if image_cond_mot_ref is not None else None, # motion reference latents for VAP
+                    "x_mot_ref": x_mot_ref_input, # motion reference latents for VAP
                     "mot_ref_context": mot_ref_context if image_cond_mot_ref is not None else None, # motion reference context for VAP
                     "mot_ref_clip_embeds": mot_ref_clip_embeds, # motion reference clip features for VAP
+                    "freqs_mot_ref": freqs_mot_ref, # motion reference RoPE freqs for VAP
                 }
 
                 batch_size = 1
@@ -1577,23 +1579,23 @@ class WanVideoSampler:
                         noise_pred_uncond.view(batch_size, -1)
                     ).view(batch_size, 1, 1, 1)
 
-                noise_pred_uncond_scaled = noise_pred_uncond * alpha
+                    noise_pred_uncond = noise_pred_uncond * alpha
 
                 if use_tangential:
-                    noise_pred_uncond_scaled = tangential_projection(noise_pred_cond, noise_pred_uncond_scaled)
+                    noise_pred_uncond = tangential_projection(noise_pred_cond, noise_pred_uncond)
 
                 # RAAG (RATIO-aware Adaptive Guidance)
                 if raag_alpha > 0.0:
-                    cfg_scale = get_raag_guidance(noise_pred_cond, noise_pred_uncond_scaled, cfg_scale, raag_alpha)
+                    cfg_scale = get_raag_guidance(noise_pred_cond, noise_pred_uncond, cfg_scale, raag_alpha)
                     log.info(f"RAAG modified cfg: {cfg_scale}")
 
                 #https://github.com/WikiChao/FreSca
                 if use_fresca:
                     filtered_cond = fourier_filter(noise_pred_cond - noise_pred_uncond, fresca_scale_low, fresca_scale_high, fresca_freq_cutoff)
-                    noise_pred = noise_pred_uncond_scaled + cfg_scale * filtered_cond * alpha
+                    noise_pred = noise_pred_uncond + cfg_scale * filtered_cond * alpha
                 else:
-                    noise_pred = noise_pred_uncond_scaled + cfg_scale * (noise_pred_cond - noise_pred_uncond_scaled)
-                del noise_pred_uncond_scaled, noise_pred_cond, noise_pred_uncond
+                    noise_pred = noise_pred_uncond + cfg_scale * (noise_pred_cond - noise_pred_uncond)
+                del noise_pred_uncond, noise_pred_cond
 
                 if latent_model_input_ovi is not None:
                     if ovi_audio_cfg is None:
