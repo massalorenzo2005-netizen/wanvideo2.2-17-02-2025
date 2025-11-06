@@ -810,7 +810,7 @@ class WanVideoAddBindweaveEmbeds:
             updated["mask"] = mask
         updated["image_embeds"] = image_embeds
         updated["qwenvl_embeds"] = qwenvl_embeds
-        return (updated, {"samples": image_embeds.unsqueeze(0)}, mask[0])
+        return (updated, {"samples": image_embeds.unsqueeze(0)}, mask[0].float())
     
 class TextImageEncodeQwenVL():
     @classmethod

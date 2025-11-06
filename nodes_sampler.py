@@ -342,12 +342,6 @@ class WanVideoSampler:
                 dtype=torch.float32,
                 generator=seed_g,
                 device=torch.device("cpu"))
-            
-            noise_front_pad_num = image_cond.shape[1] - noise.shape[1]
-            if noise_front_pad_num > 0:
-                pad = torch.zeros((noise.shape[0], noise_front_pad_num, noise.shape[2], noise.shape[3]), dtype=noise.dtype, device=noise.device)
-                noise = torch.concat([pad, noise], dim=1)
-
 
             control_embeds = image_embeds.get("control_embeds", None)
             if control_embeds is not None:
@@ -1353,6 +1347,12 @@ class WanVideoSampler:
                     c_noise = (torch.sin(timestep) / (torch.cos(timestep) + torch.sin(timestep))) * 1000
                     z = z * c_in
                     timestep = c_noise
+
+                self.noise_front_pad_num = image_cond_input.shape[1] - z.shape[1]
+                if self.noise_front_pad_num > 0:
+                    pad = torch.zeros((z.shape[0], self.noise_front_pad_num, z.shape[2], z.shape[3]), dtype=z.dtype, device=z.device)
+                    z = torch.concat([pad, z], dim=1)
+                    seq_len = math.ceil((z.shape[2] * z.shape[3]) / 4 * z.shape[1])
 
                 base_params = {
                     'x': [z], # latent
@@ -2970,6 +2970,9 @@ class WanVideoSampler:
                     if flowedit_args is None:
                         latent = latent.to(intermediate_device)
 
+                        if self.noise_front_pad_num > 0:
+                            noise_pred = noise_pred[:, self.noise_front_pad_num:]
+
                         if use_tsr:
                             noise_pred = temporal_score_rescaling(noise_pred, latent, timestep, tsr_k, tsr_sigma)
 
@@ -3069,8 +3072,6 @@ class WanVideoSampler:
             latent = latent[:,:-phantom_latents.shape[1]]
         if humo_reference_count > 0:
             latent = latent[:,:-humo_reference_count]
-        if noise_front_pad_num > 0:
-            latent = latent[:, noise_front_pad_num:]
 
         cache_states = None
         if cache_args is not None:
