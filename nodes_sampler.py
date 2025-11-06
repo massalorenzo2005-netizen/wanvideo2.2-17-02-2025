@@ -342,6 +342,8 @@ class WanVideoSampler:
                 dtype=torch.float32,
                 generator=seed_g,
                 device=torch.device("cpu"))
+            
+            seq_len = math.ceil((noise.shape[2] * noise.shape[3]) / 4 * noise.shape[1])
 
             control_embeds = image_embeds.get("control_embeds", None)
             if control_embeds is not None:
@@ -411,6 +413,7 @@ class WanVideoSampler:
                     device=torch.device("cpu"),
                     generator=seed_g)
             
+            seq_len = math.ceil((noise.shape[2] * noise.shape[3]) / 4 * noise.shape[1])
 
             recammaster = image_embeds.get("recammaster", None)
             if recammaster is not None:
@@ -861,7 +864,6 @@ class WanVideoSampler:
                 seq_len = math.ceil((noise.shape[2] * noise.shape[3]) / 4 * noise.shape[1])
 
         latent = noise
-        seq_len = math.ceil((noise.shape[2] * noise.shape[3]) / 4 * noise.shape[1])
 
         #controlnet
         controlnet_latents = controlnet = None
@@ -1353,6 +1355,7 @@ class WanVideoSampler:
                 if self.noise_front_pad_num > 0:
                     pad = torch.zeros((z.shape[0], self.noise_front_pad_num, z.shape[2], z.shape[3]), dtype=z.dtype, device=z.device)
                     z = torch.concat([pad, z], dim=1)
+                    nonlocal seq_len
                     seq_len = math.ceil((z.shape[2] * z.shape[3]) / 4 * z.shape[1])
 
                 base_params = {
