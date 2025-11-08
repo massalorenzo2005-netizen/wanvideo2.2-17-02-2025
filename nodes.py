@@ -834,10 +834,13 @@ class TextImageEncodeQwenVL():
     def add(cls, clip, prompt, image=None):
         if image is None:
             input_images = []
+            llama_template = None
         else:
             input_images = [image[:, :, :, :3]]
 
-        tokens = clip.tokenize(prompt, images=input_images)
+            llama_template = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>{}<|im_end|>\n<|im_start|>assistant\n"
+
+        tokens = clip.tokenize(prompt, images=input_images, llama_template=llama_template)
         conditioning = clip.encode_from_tokens_scheduled(tokens)
         print("Qwen-VL embeds shape:", conditioning[0][0].shape)
         return (conditioning[0][0],)
