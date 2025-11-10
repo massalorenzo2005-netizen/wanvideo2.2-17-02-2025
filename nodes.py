@@ -812,16 +812,15 @@ class WanVideoAddBindweaveEmbeds:
 
         clip_embeds = updated.get("clip_context", None)
         if clip_embeds is not None:
-            if clip_embeds.shape[1] != 257:
-                clip_embeds = clip_embeds.view(clip_embeds.shape[1] // 257, 257, clip_embeds.shape[2])
-            N = clip_embeds.shape[0]
             B, T, C = clip_embeds.shape
-            pad = torch.zeros(B, 0, C, device=clip_embeds.device, dtype=clip_embeds.dtype)
-            if N < max_refs:
-                pad = torch.zeros(B, (max_refs-N)*T, C, device=clip_embeds.device, dtype=clip_embeds.dtype)
+            target_len = max_refs * 257  # 4 * 257 = 1028
+            if T < target_len:
+                pad = torch.zeros(B, target_len - T, C, device=clip_embeds.device, dtype=clip_embeds.dtype)
                 padded_embeds = torch.cat([clip_embeds, pad], dim=1)
                 log.info(f"Padded clip embeds from {clip_embeds.shape} to {padded_embeds.shape} for Bindweave")
                 updated["clip_context"] = padded_embeds
+            else:
+                updated["clip_context"] = clip_embeds
 
         updated["image_embeds"] = image_embeds
         updated["qwenvl_embeds_pos"] = qwenvl_embeds_pos
