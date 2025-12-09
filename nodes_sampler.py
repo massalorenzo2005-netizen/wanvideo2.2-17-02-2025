@@ -5,23 +5,21 @@ from tqdm import tqdm
 import inspect
 from PIL import Image
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
-
+from .wanvideo.schedulers.fm_solvers import get_sampling_sigmas, retrieve_timesteps
 from .wanvideo.modules.model import rope_params
 from .custom_linear import remove_lora_from_module, set_lora_params, _replace_linear
-from .wanvideo.schedulers import get_scheduler, get_sampling_sigmas, retrieve_timesteps, scheduler_list
+from .wanvideo.schedulers import get_scheduler, scheduler_list
 from .gguf.gguf import set_lora_params_gguf
 from .multitalk.multitalk import timestep_transform, add_noise
-from .utils import(log, print_memory, apply_lora, clip_encode_image_tiled, fourier_filter, optimized_scale, setup_radial_attention,
-                   compile_model, dict_to_device, tangential_projection, set_module_tensor_to_device, get_raag_guidance, temporal_score_rescaling)
+from .utils import(log, print_memory, apply_lora, fourier_filter, optimized_scale, setup_radial_attention,
+                   compile_model, dict_to_device, tangential_projection, get_raag_guidance, temporal_score_rescaling)
 from .cache_methods.cache_methods import cache_report
 from .nodes_model_loading import load_weights
 from .enhance_a_video.globals import set_enhance_weight, set_num_frames
 from contextlib import nullcontext
-from einops import rearrange
 
 from comfy import model_management as mm
 from comfy.utils import ProgressBar, load_torch_file
-from comfy.clip_vision import clip_preprocess, ClipVisionModel
 from comfy.cli_args import args, LatentPreviewMethod
 
 script_directory = os.path.dirname(os.path.abspath(__file__))
@@ -46,7 +44,7 @@ class MetaParameter(torch.nn.Parameter):
         self.quant_type = quant_type
         return self
 
-def offload_transformer(transformer):    
+def offload_transformer(transformer, remove_lora=True):
     transformer.teacache_state.clear_all()
     transformer.magcache_state.clear_all()
     transformer.easycache_state.clear_all()
@@ -68,6 +66,8 @@ def offload_transformer(transformer):
                 setattr(module, attr_name, MetaParameter(param.data.dtype, quant_type))
             else:
                 pass
+        if remove_lora:
+            remove_lora_from_module(transformer)
     else:
         transformer.to(offload_device)
 
@@ -198,7 +198,7 @@ class WanVideoSampler:
             transformer = _replace_linear(transformer, dtype, patcher.model["sd"], compile_args=model["compile_args"])
             transformer.patched_linear = True
         if patcher.model["sd"] is not None and gguf_reader is None:
-            load_weights(patcher.model.diffusion_model, patcher.model["sd"], weight_dtype, base_dtype=dtype, transformer_load_device=device, 
+            load_weights(patcher.model.diffusion_model, patcher.model["sd"], weight_dtype, base_dtype=dtype, transformer_load_device=device,
                          block_swap_args=block_swap_args, compile_args=model["compile_args"])
 
         if gguf_reader is not None: #handle GGUF
@@ -291,7 +291,7 @@ class WanVideoSampler:
         else:
             cfg = [cfg] * (steps + 1)
 
-        control_latents = control_camera_latents = clip_fea = clip_fea_neg = end_image = recammaster = camera_embed = unianim_data = mocha_embeds = None
+        control_latents = control_camera_latents = clip_fea = clip_fea_neg = end_image = recammaster = camera_embed = unianim_data = mocha_embeds = image_cond_neg =None
         vace_data = vace_context = vace_scale = None
         fun_or_fl2v_model = has_ref = drop_last = False
         phantom_latents = fun_ref_image = ATI_tracks = None
@@ -301,6 +301,15 @@ class WanVideoSampler:
         #I2V
         image_cond = image_embeds.get("image_embeds", None)
         if image_cond is not None:
+            # WanMove
+            wanmove_embeds = image_embeds.get("wanmove_embeds", None)
+            if wanmove_embeds is not None:
+                from .WanMove.trajectory import replace_feature
+                track_pos = wanmove_embeds["track_pos"]
+                if any(not math.isclose(c, 1.0) for c in cfg):
+                    image_cond_neg = torch.cat([image_embeds["mask"], image_cond])
+                image_cond = replace_feature(image_cond.unsqueeze(0), track_pos.unsqueeze(0))[0]
+
             if transformer.in_dim == 16:
                 raise ValueError("T2V (text to video) model detected, encoded images only work with I2V (Image to video) models")
             elif transformer.in_dim not in [48, 32]: # fun 2.1 models don't use the mask
@@ -343,7 +352,7 @@ class WanVideoSampler:
                 dtype=torch.float32,
                 generator=seed_g,
                 device=torch.device("cpu"))
-            
+
             seq_len = math.ceil((noise.shape[2] * noise.shape[3]) / 4 * noise.shape[1])
 
             control_embeds = image_embeds.get("control_embeds", None)
@@ -413,7 +422,7 @@ class WanVideoSampler:
                     dtype=torch.float32,
                     device=torch.device("cpu"),
                     generator=seed_g)
-            
+
             seq_len = math.ceil((noise.shape[2] * noise.shape[3]) / 4 * noise.shape[1])
 
             recammaster = image_embeds.get("recammaster", None)
@@ -424,7 +433,7 @@ class WanVideoSampler:
                 log.info(f"RecamMaster camera embed shape: {camera_embed.shape}")
                 log.info(f"RecamMaster source video shape: {recam_latents.shape}")
                 seq_len *= 2
-            
+
             if image_embeds.get("mocha_embeds", None) is not None:
                 mocha_embeds = image_embeds.get("mocha_embeds", None)
                 mocha_num_refs = image_embeds.get("mocha_num_refs", 0)
@@ -1020,7 +1029,7 @@ class WanVideoSampler:
         if experimental_args is not None:
             video_attention_split_steps = experimental_args.get("video_attention_split_steps", [])
             if video_attention_split_steps:
-                transformer.video_attention_split_steps = [int(x.strip()) for x in video_attention_split_steps.split(",")]                
+                transformer.video_attention_split_steps = [int(x.strip()) for x in video_attention_split_steps.split(",")]
 
             use_zero_init = experimental_args.get("use_zero_init", True)
             use_cfg_zero_star = experimental_args.get("cfg_zero_star", False)
@@ -1063,7 +1072,7 @@ class WanVideoSampler:
             from .mocha.nodes import rope_params_mocha
             log.info(f"Using Mocha RoPE")
             rope_function = 'mocha'
-            
+
             freqs = torch.cat([
                 rope_params_mocha(1024, d - 4 * (d // 6), L_test=latent_video_length, k=riflex_freq_index, start=-1),
                 rope_params_mocha(1024, 2 * (d // 6), start=-1),
@@ -1100,6 +1109,7 @@ class WanVideoSampler:
             lynx_ref_latent = lynx_embeds.get("ref_latent", None)
             lynx_ref_latent_uncond = lynx_embeds.get("ref_latent_uncond", None)
             lynx_ref_text_embed = lynx_embeds.get("ref_text_embed", None)
+            lynx_ref_text_embed = dict_to_device(lynx_ref_text_embed, device)
             lynx_cfg_scale = lynx_embeds.get("cfg_scale", 1.0)
             if not isinstance(lynx_cfg_scale, list):
                 lynx_cfg_scale = [lynx_cfg_scale] * (steps + 1)
@@ -1113,7 +1123,7 @@ class WanVideoSampler:
                 log.info(f"Lynx ref latent shape: {lynx_ref_latent.shape}")
                 log.info("Extracting Lynx ref cond buffer...")
                 if transformer.in_dim == 36:
-                    mask_latents = torch.tile(torch.zeros_like(lynx_ref_latent[:1]), [4, 1, 1, 1]) 
+                    mask_latents = torch.tile(torch.zeros_like(lynx_ref_latent[:1]), [4, 1, 1, 1])
                     empty_image_cond = torch.cat([mask_latents, torch.zeros_like(lynx_ref_latent)], dim=0).to(device)
                     lynx_ref_input = torch.cat([lynx_ref_latent, empty_image_cond], dim=0)
                 else:
@@ -1126,7 +1136,7 @@ class WanVideoSampler:
                     lynx_embeds=lynx_embeds
                 )
                 log.info(f"Extracted {len(lynx_ref_buffer)} cond ref buffers")
-                if not math.isclose(cfg[0], 1.0):
+                if any(not math.isclose(c, 1.0) for c in cfg):
                     log.info("Extracting Lynx ref uncond buffer...")
                     if transformer.in_dim == 36:
                         lynx_ref_input_uncond = torch.cat([lynx_ref_latent_uncond, empty_image_cond], dim=0)
@@ -1141,7 +1151,7 @@ class WanVideoSampler:
                         is_uncond=True
                     )
                     log.info(f"Extracted {len(lynx_ref_buffer_uncond)} uncond ref buffers")
-                
+
             if lynx_embeds.get("ip_x", None) is not None:
                 lynx_embeds["ip_x"] = lynx_embeds["ip_x"].to(device, dtype)
                 lynx_embeds["ip_x_uncond"] = lynx_embeds["ip_x_uncond"].to(device, dtype)
@@ -1179,6 +1189,41 @@ class WanVideoSampler:
                 log.info(f"Applying TTM from step {ttm_start_step} to {ttm_end_step}")
 
                 latent = add_noise(ttm_reference_latents, noise, timesteps[ttm_start_step].to(noise.device)).to(latent)
+
+        # SteadyDancer
+        sdancer_embeds = image_embeds.get("sdancer_embeds", None)
+        sdancer_data = sdancer_input = None
+        if sdancer_embeds is not None:
+            log.info("Using SteadyDancer embeddings:")
+            for k, v in sdancer_embeds.items():
+                log.info(f"  {k}: {v.shape if isinstance(v, torch.Tensor) else v}")
+            sdancer_data = sdancer_embeds.copy()
+            sdancer_data = dict_to_device(sdancer_data, device, dtype)
+
+        # One-to-all-Animation
+        one_to_all_embeds = image_embeds.get("one_to_all_embeds", None)
+        one_to_all_data = prev_latents = None
+        latents_to_not_step = 0
+        if one_to_all_embeds is not None:
+            log.info("Using One-to-All embeddings:")
+            for k, v in one_to_all_embeds.items():
+                log.info(f"  {k}: {v.shape if isinstance(v, torch.Tensor) else v}")
+            one_to_all_data = one_to_all_embeds.copy()
+            one_to_all_data = dict_to_device(one_to_all_data, device, dtype)
+            if one_to_all_embeds.get("pose_images") is not None:
+                pose_images_in = one_to_all_data.pop("pose_images")
+                pose_images = transformer.input_hint_block(pose_images_in)
+                if one_to_all_embeds.get("ref_latent_pos") is not None:
+                    pose_prefix_image = transformer.input_hint_block(one_to_all_data.pop("pose_prefix_image"))
+                    pose_images = torch.cat([pose_prefix_image, pose_images],dim=2)
+                one_to_all_data["controlnet_tokens"] = pose_images.flatten(2).transpose(1, 2)
+            prev_latents = one_to_all_data.get("prev_latents", None)
+            if prev_latents is not None:
+                log.info(f"Using previous latents for One-to-All Animation with shape: {prev_latents.shape}")
+                latent[:, :prev_latents.shape[1]] = prev_latents.to(latent)
+                one_to_all_data["token_replace"] = True
+                latents_to_not_step = prev_latents.shape[1]
+                one_to_all_data["num_latent_frames_to_replace"] = latents_to_not_step
 
         #region model pred
         def predict_with_cfg(z, cfg_scale, positive_embeds, negative_embeds, timestep, idx, image_cond=None, clip_fea=None,
@@ -1233,6 +1278,7 @@ class WanVideoSampler:
                               (ati_end_percent > 0 and idx == 0 and current_step_percentage >= ati_start_percent)):
                     image_cond_input = image_cond_ati.to(z)
                 elif humo_image_cond is not None:
+                    humo_image_cond_neg_input = None
                     if context_window is not None:
                         image_cond_input = humo_image_cond[:, context_window].to(z)
                         humo_image_cond_neg_input = humo_image_cond_neg[:, context_window].to(z)
@@ -1240,8 +1286,15 @@ class WanVideoSampler:
                             image_cond_input[:, -humo_reference_count:] = humo_image_cond[:, -humo_reference_count:]
                             humo_image_cond_neg_input[:, -humo_reference_count:] = humo_image_cond_neg[:, -humo_reference_count:]
                     else:
-                        image_cond_input = humo_image_cond.to(z)
-                        humo_image_cond_neg_input = humo_image_cond_neg.to(z)
+                        if image_cond is not None:
+                            image_cond_input = image_cond.to(z)
+                            if humo_reference_count > 0:
+                                image_cond_input = torch.cat([image_cond_input, humo_image_cond[:, -humo_reference_count:].to(z)], dim=1)
+                                humo_image_cond_neg_input = torch.cat([image_cond_input, humo_image_cond_neg[:, -humo_reference_count:].to(z)], dim=1)
+                        else:
+                            image_cond_input = humo_image_cond.to(z)
+                            humo_image_cond_neg_input = humo_image_cond_neg.to(z)
+
                 elif image_cond is not None:
                     if reverse_time: # Flip the image condition
                         image_cond_input = torch.cat([
@@ -1260,7 +1313,7 @@ class WanVideoSampler:
 
                 if recammaster is not None:
                     z = torch.cat([z, recam_latents.to(z)], dim=1)
-                
+
                 if mocha_embeds is not None:
                     if context_window is not None and mocha_embeds.shape[2] != context_frames:
                         latent_frames = len(context_window)
@@ -1270,7 +1323,7 @@ class WanVideoSampler:
                         partial_latents = mocha_embeds[:, context_window]  # windowed latents
                         mask_frame = mocha_embeds[:, latent_end:mask_end]  # single mask frame
                         ref_frames = mocha_embeds[:, -mocha_num_refs:]     # reference frames
-                        
+
                         partial_mocha_embeds = torch.cat([partial_latents, mask_frame, ref_frames], dim=1)
                         z = torch.cat([z, partial_mocha_embeds.to(z)], dim=1)
                     else:
@@ -1356,6 +1409,13 @@ class WanVideoSampler:
                             uni3c_data_input[k] = uni3c_data[k]
                 else:
                     uni3c_data_input = uni3c_data
+
+                if context_window is not None and sdancer_data is not None and sdancer_data["cond_pos"].shape[1] != context_frames:
+                    sdancer_input = sdancer_data.copy()
+                    sdancer_input["cond_pos"] = sdancer_data["cond_pos"][:, context_window]
+                    sdancer_input["cond_neg"] = sdancer_data["cond_neg"][:, context_window] if sdancer_data.get("cond_neg", None) is not None else None
+                else:
+                    sdancer_input = sdancer_data
 
                 if s2v_pose is not None:
                     if not ((s2v_pose_start_percent <= current_step_percentage <= s2v_pose_end_percent) or \
@@ -1459,6 +1519,8 @@ class WanVideoSampler:
                     "flashvsr_LQ_latent": flashvsr_LQ_latent, # FlashVSR LQ latent for upsampling
                     "flashvsr_strength": flashvsr_strength, # FlashVSR strength
                     "num_cond_latents": len(all_indices) if transformer.is_longcat else None,
+                    "sdancer_input": sdancer_input, # SteadyDancer input
+                    "one_to_all_input": one_to_all_data, # One-to-All input
                 }
 
                 batch_size = 1
@@ -1492,6 +1554,7 @@ class WanVideoSampler:
                         base_params['is_uncond'] = True
                         base_params['clip_fea'] = clip_fea_neg if clip_fea_neg is not None else clip_fea
                         base_params["add_text_emb"] = qwenvl_embeds_neg.to(device) if qwenvl_embeds_neg is not None else None # QwenVL embeddings for Bindweave
+                        base_params['y'] = image_cond_neg if image_cond_neg is not None else base_params['y']
                         if wananim_face_pixels is not None:
                             base_params['wananim_face_pixel_values'] = torch.zeros_like(wananim_face_pixels).to(device, torch.float32) - 1
                         if humo_audio_input_neg is not None:
@@ -1681,6 +1744,7 @@ class WanVideoSampler:
         # Main sampling loop with FreeInit iterations
         iterations = freeinit_args.get("freeinit_num_iters", 3) if freeinit_args is not None else 1
         current_latent = latent
+        initial_noise_saved = None
 
         for iter_idx in range(iterations):
 
@@ -2360,7 +2424,6 @@ class WanVideoSampler:
                                 vae.to(device)
                                 # Pad original_images if needed
                                 num_frames = original_images.shape[2]
-                                required_frames = audio_end_idx - audio_start_idx
                                 if audio_end_idx > num_frames:
                                     pad_len = audio_end_idx - num_frames
                                     last_frame = original_images[:, :, -1:].repeat(1, 1, pad_len, 1, 1)
@@ -2456,7 +2519,7 @@ class WanVideoSampler:
 
                             del noise, latent_motion_frames
                             if offload:
-                                offload_transformer(transformer)
+                                offload_transformer(transformer, remove_lora=False)
                                 offloaded = True
                             if humo_image_cond is not None and humo_reference_count > 0:
                                 latent = latent[:,:-humo_reference_count]
@@ -2526,9 +2589,9 @@ class WanVideoSampler:
                                         source_frame = len(audio_embedding[human_inx])
                                         source_frames.append(source_frame)
                                         if audio_end_idx >= len(audio_embedding[human_inx]):
-                                            print(f"Audio embedding for subject {human_inx} not long enough: {len(audio_embedding[human_inx])}, need {audio_end_idx}, padding...")
+                                            log.warning(f"Audio embedding for subject {human_inx} not long enough: {len(audio_embedding[human_inx])}, need {audio_end_idx}, padding...")
                                             miss_length = audio_end_idx - len(audio_embedding[human_inx]) + 3
-                                            print(f"Padding length: {miss_length}")
+                                            log.warning(f"Padding length: {miss_length}")
                                             if encoded_silence is not None:
                                                 add_audio_emb = encoded_silence[-1*miss_length:]
                                             else:
@@ -2767,7 +2830,7 @@ class WanVideoSampler:
 
                             if current_ref_images is not None or bg_images is not None or ref_latent is not None:
                                 if offload:
-                                    offload_transformer(transformer)
+                                    offload_transformer(transformer, remove_lora=False)
                                     offloaded = True
                                 vae.to(device)
                                 if wananim_ref_masks is not None:
@@ -2807,7 +2870,7 @@ class WanVideoSampler:
                                 vae.to(device)
                                 pose_image_slice = pose_images_in[:, start:end].to(device)
                                 pose_input_slice = vae.encode([pose_image_slice], device,tiled=tiled_vae, pbar=False).to(dtype)
-                            
+
                             vae.to(offload_device)
 
                             if wananim_face_pixels is None and wananim_ref_masks is not None:
@@ -2930,7 +2993,7 @@ class WanVideoSampler:
 
                             del noise
                             if offload:
-                                offload_transformer(transformer)
+                                offload_transformer(transformer, remove_lora=False)
                                 offloaded = True
 
                             vae.to(device)
@@ -2996,7 +3059,7 @@ class WanVideoSampler:
                     #region normal inference
                     else:
                         noise_pred, noise_pred_ovi, self.cache_state = predict_with_cfg(
-                            latent_model_input, 
+                            latent_model_input,
                             cfg[idx], text_embeds["prompt_embeds"], text_embeds["negative_prompt_embeds"],
                             timestep, idx, image_cond, clip_fea, control_latents, vace_data, unianim_data, audio_proj, control_camera_latents, add_cond,
                             cache_state=self.cache_state, fantasy_portrait_input=fantasy_portrait_input, multitalk_audio_embeds=multitalk_audio_embeds, mtv_motion_tokens=mtv_motion_tokens, s2v_audio_input=s2v_audio_input,
@@ -3052,11 +3115,16 @@ class WanVideoSampler:
                                     new_latent.append(latent_slice[:, j:j+1])
                             latent = torch.cat(new_latent, dim=1)
                         else:
-                            latent = sample_scheduler.step(
-                                noise_pred[:, :orig_noise_len].unsqueeze(0) if recammaster is not None or mocha_embeds is not None else noise_pred.unsqueeze(0),
-                                timestep,
-                                latent[:, :orig_noise_len].unsqueeze(0) if recammaster is not None or mocha_embeds is not None else latent.unsqueeze(0),
-                                **scheduler_step_args)[0].squeeze(0)
+                            if latents_to_not_step > 0:
+                                raw_latent = latent[:, :latents_to_not_step]
+                                noise_pred_in = noise_pred[:, latents_to_not_step:]
+                                latent = latent[:, latents_to_not_step:]
+                            elif recammaster is not None or mocha_embeds is not None:
+                                noise_pred_in = noise_pred[:, :orig_noise_len]
+                                latent = latent[:, :orig_noise_len]
+                            else:
+                                noise_pred_in = noise_pred
+                            latent = sample_scheduler.step(noise_pred_in.unsqueeze(0), timestep, latent.unsqueeze(0), **scheduler_step_args)[0].squeeze(0)
                             if noise_pred_flipped is not None:
                                 latent_backwards = sample_scheduler_flipped.step(
                                     noise_pred_flipped.unsqueeze(0),
@@ -3065,7 +3133,9 @@ class WanVideoSampler:
                                     **scheduler_step_args)[0].squeeze(0)
                                 latent_backwards = torch.flip(latent_backwards, dims=[1])
                                 latent = latent * 0.5 + latent_backwards * 0.5
-                        
+                            if latents_to_not_step > 0:
+                                latent = torch.cat([raw_latent, latent], dim=1)
+
                         if latent_ovi is not None:
                             latent_ovi = sample_scheduler_ovi.step(noise_pred_ovi.unsqueeze(0), t, latent_ovi.to(device).unsqueeze(0), **scheduler_step_args)[0].squeeze(0)
 
@@ -3087,7 +3157,7 @@ class WanVideoSampler:
                                 )
                                 mask = masks[idx].to(latent)
                                 latent = image_latent * mask + latent * (1-mask)
-                        
+
                         # TTM
                         if ttm_reference_latents is not None and (idx + ttm_start_step) < ttm_end_step:
                             if idx + ttm_start_step + 1 < len(sample_scheduler.all_timesteps):
