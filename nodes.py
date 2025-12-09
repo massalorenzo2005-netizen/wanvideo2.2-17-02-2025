@@ -1094,15 +1094,15 @@ class WanVideoAnimateEmbeds:
             "height": ("INT", {"default": 480, "min": 64, "max": 8096, "step": 8, "tooltip": "Height of the image to encode"}),
             "num_frames": ("INT", {"default": 81, "min": 1, "max": 10000, "step": 4, "tooltip": "Number of frames to encode"}),
             "force_offload": ("BOOLEAN", {"default": True}),
-            "frame_window_size": ("INT", {"default": 77, "min": 1, "max": 1000, "step": 1, "tooltip": "Number of frames to use for temporal attention window"}),
+            "frame_window_size": ("INT", {"default": 77, "min": 1, "max": 10000, "step": 1, "tooltip": "Number of frames to use for temporal attention window"}),
             "colormatch": (
-            [   
+            [
                 'disabled',
                 'mkl',
-                'hm', 
-                'reinhard', 
-                'mvgd', 
-                'hm-mvgd-hm', 
+                'hm',
+                'reinhard',
+                'mvgd',
+                'hm-mvgd-hm',
                 'hm-mkl-hm',
             ], {
                "default": 'disabled', "tooltip": "Color matching method to use between the windows"
