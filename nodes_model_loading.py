@@ -1517,7 +1517,11 @@ class WanVideoModelLoader:
             # One-to-all
             from .onetoall.controlnet import MiniHunyuanEncoder, MiniEncoder2D
             from .onetoall.refextractor_2d import WanRefextractor, WanAttentionBlock
-            log.info("One-to-all model detected, patching model...")
+
+            controlnet_layers = len({k.split(".")[2] for k in sd if k.startswith("controlnet.blocks.")})
+            refextractor_layers = len({k.split(".")[2] for k in sd if k.startswith("refextractor.blocks.")})
+            log.info(f"{controlnet_layers} One-to-all controlnet layers and {refextractor_layers} refextractor layers detected, patching model...")
+
             with init_empty_weights():
                 transformer.image_to_cond = MiniEncoder2D(
                     in_channels = sd["image_to_cond.conv_in.bias"].shape[0],
@@ -1538,14 +1542,13 @@ class WanVideoModelLoader:
                     spatial_compression_ratio=16
                 )
 
-                controlnet_layers = 1
                 transformer.controlnet = nn.Module()
                 transformer.controlnet.blocks = nn.ModuleList([WanAttentionBlock(in_features, out_features, ffn_dim, ffn2_dim, num_heads) for _ in range(controlnet_layers)])
                 transformer.controlnet_zero = nn.ModuleList([nn.Linear(in_features, out_features) for _ in range(controlnet_layers)])
                 transformer.refextractor = WanRefextractor(
                     patch_size=(1, 2, 2), in_dim=sd["refextractor.patch_embedding.weight"].shape[1],
                     dim=dim, in_features=in_features, out_features=out_features, ffn_dim=ffn_dim, ffn2_dim=ffn2_dim,
-                        num_heads=num_heads, num_layers=7)
+                        num_heads=num_heads, num_layers=refextractor_layers)
 
                 for block in transformer.blocks:
                     block.ref_attn_k_img = nn.Linear(in_features, out_features)
