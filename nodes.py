@@ -5,6 +5,7 @@ import hashlib
 
 from .utils import(log, clip_encode_image_tiled, add_noise_to_reference_video, set_module_tensor_to_device)
 from .taehv import TAEHV
+from .wanvideo.modules.alignvid_asm import AlignVidScheduler
 
 from comfy import model_management as mm
 from comfy.utils import ProgressBar, common_upscale
@@ -2216,6 +2217,228 @@ class WanVideoEncode:
 
         return ({"samples": latents, "noise_mask": mask},)
 
+
+class AlignVidConfigNode:
+    """
+    Configuration node for AlignVid ASM parameters.
+    Creates a config dict that can be passed to ApplyAlignVid node.
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "use_alignvid": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Enable/disable AlignVid ASM globally"
+                }),
+                "bgs_mode": (["first_half", "all"], {
+                    "default": "first_half",
+                    "tooltip": "Block gating: first_half applies to first 50% of blocks"
+                }),
+                "gamma": ("FLOAT", {
+                    "default": 1.35,
+                    "min": 1.0,
+                    "max": 3.0,
+                    "step": 0.05,
+                    "tooltip": "Base scaling coefficient (paper default: 1.35)"
+                }),
+                "t_low": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 100,
+                    "tooltip": "SGS start timestep (0-based)"
+                }),
+                "t_high": ("INT", {
+                    "default": 20,
+                    "min": 0,
+                    "max": 100,
+                    "tooltip": "SGS end timestep (paper default: 20)"
+                }),
+                "total_steps": ("INT", {
+                    "default": 25,
+                    "min": 1,
+                    "max": 100,
+                    "tooltip": "Total diffusion steps"
+                }),
+                "scale_keys": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Scale keys (True) or queries (False)"
+                }),
+                "energy_low": ("FLOAT", {
+                    "default": 1.0,
+                    "min": 0.5,
+                    "max": 2.0,
+                    "step": 0.1,
+                    "tooltip": "Lower bound for energy mapping f(E)"
+                }),
+                "energy_high": ("FLOAT", {
+                    "default": 2.0,
+                    "min": 1.0,
+                    "max": 3.0,
+                    "step": 0.1,
+                    "tooltip": "Upper bound for energy mapping f(E)"
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("ALIGNVID_CONFIG",)
+    FUNCTION = "create_config"
+    CATEGORY = "WanVideo/AlignVid"
+    DESCRIPTION = "Configure AlignVid ASM parameters for semantic fidelity"
+
+    def create_config(self, use_alignvid, bgs_mode, gamma, t_low, t_high,
+                      total_steps, scale_keys, energy_low, energy_high):
+        config = {
+            'use_alignvid': use_alignvid,
+            'bgs_mode': bgs_mode,
+            'gamma': gamma,
+            't_low': t_low,
+            't_high': t_high,
+            'total_steps': total_steps,
+            'scale_keys': scale_keys,
+            'energy_low': energy_low,
+            'energy_high': energy_high,
+        }
+        return (config,)
+
+
+class ApplyAlignVid:
+    """
+    Applies AlignVid configuration to WanVideo model.
+    Attaches scheduler to all transformer blocks.
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("WANVIDEOMODEL", ),
+                "alignvid_config": ("ALIGNVID_CONFIG",),
+            }
+        }
+
+    RETURN_TYPES = ("WANVIDEOMODEL",)
+    RETURN_NAMES = ("model",)
+    FUNCTION = "apply"
+    CATEGORY = "WanVideo/AlignVid"
+    DESCRIPTION = "Apply AlignVid ASM to WanVideo model"
+
+    def apply(self, model, alignvid_config):
+        transformer = model.model.diffusion_model
+        # Check if AlignVid should be enabled
+        if not alignvid_config.get('use_alignvid', False):
+            print("AlignVid: Disabled via use_alignvid=False")
+            # Clear any existing scheduler
+            for block in transformer.blocks:
+                if hasattr(block, 'alignvid_scheduler'):
+                    block.alignvid_scheduler = None
+            return (model,)
+
+        # Create scheduler with config parameters
+        num_blocks = len(transformer.blocks)
+        scheduler = AlignVidScheduler(
+            num_blocks=num_blocks,
+            bgs_mode=alignvid_config['bgs_mode'],
+            gamma=alignvid_config['gamma'],
+            t_low=alignvid_config['t_low'],
+            t_high=alignvid_config['t_high'],
+            total_steps=alignvid_config['total_steps'],
+            scale_queries=not alignvid_config['scale_keys'],
+            scale_keys=alignvid_config['scale_keys'],
+            energy_low=alignvid_config['energy_low'],
+            energy_high=alignvid_config['energy_high'],
+        )
+
+        # Attach scheduler to all blocks
+        active_blocks = scheduler.bgs_mask.sum().item()
+        for block in transformer.blocks:
+            block.alignvid_scheduler = scheduler
+
+        # Print configuration summary
+        print("=" * 60)
+        print("AlignVid ASM Enabled")
+        print("=" * 60)
+        print(f"  Total blocks: {num_blocks}")
+        print(f"  Active blocks: {active_blocks} ({scheduler.bgs_mode})")
+        print(f"  Base gamma: {scheduler.gamma}")
+        print(f"  SGS window: [{scheduler.t_low}, {scheduler.t_high}]")
+        print(f"  Scaling: {'Keys' if scheduler.scale_keys else 'Queries'}")
+        print(f"  Energy range: [{scheduler.energy_low}, {scheduler.energy_high}]")
+        print("=" * 60)
+
+        return (model,)
+
+
+# Optional: Preset configurations node
+class AlignVidPresets:
+    """
+    Quick preset configurations for common use cases.
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "preset": (["default", "strong", "subtle", "late_steps"], {
+                    "default": "default"
+                }),
+                "use_alignvid": ("BOOLEAN", {"default": True}),
+                "total_steps": ("INT", {"default": 25, "min": 1, "max": 100}),
+            }
+        }
+
+    RETURN_TYPES = ("ALIGNVID_CONFIG",)
+    FUNCTION = "get_preset"
+    CATEGORY = "WanVideo/AlignVid"
+
+    def get_preset(self, preset, use_alignvid, total_steps):
+        presets = {
+            "default": {
+                "bgs_mode": "first_half",
+                "gamma": 1.35,
+                "t_low": 0,
+                "t_high": 20,
+                "scale_keys": True,
+                "energy_low": 1.0,
+                "energy_high": 2.0,
+            },
+            "strong": {
+                "bgs_mode": "all",
+                "gamma": 1.5,
+                "t_low": 0,
+                "t_high": min(30, total_steps),
+                "scale_keys": True,
+                "energy_low": 1.0,
+                "energy_high": 2.5,
+            },
+            "subtle": {
+                "bgs_mode": "first_half",
+                "gamma": 1.15,
+                "t_low": 0,
+                "t_high": 15,
+                "scale_keys": True,
+                "energy_low": 1.0,
+                "energy_high": 1.5,
+            },
+            "late_steps": {
+                "bgs_mode": "first_half",
+                "gamma": 1.35,
+                "t_low": 10,
+                "t_high": min(25, total_steps),
+                "scale_keys": True,
+                "energy_low": 1.0,
+                "energy_high": 2.0,
+            }
+        }
+
+        config = presets[preset].copy()
+        config['use_alignvid'] = use_alignvid
+        config['total_steps'] = total_steps
+
+        return (config,)
+
+
 NODE_CLASS_MAPPINGS = {
     "WanVideoDecode": WanVideoDecode,
     "WanVideoTextEncode": WanVideoTextEncode,
@@ -2255,6 +2478,9 @@ NODE_CLASS_MAPPINGS = {
     "TextImageEncodeQwenVL": TextImageEncodeQwenVL,
     "WanVideoUniLumosEmbeds": WanVideoUniLumosEmbeds,
     "WanVideoAddTTMLatents": WanVideoAddTTMLatents,
+    "AlignVidConfig": AlignVidConfigNode,
+    "ApplyAlignVid": ApplyAlignVid,
+    "AlignVidPresets": AlignVidPresets,
     }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -2296,4 +2522,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoAddBindweaveEmbeds": "WanVideo Add Bindweave Embeds",
     "WanVideoUniLumosEmbeds": "WanVideo UniLumos Embeds",
     "WanVideoAddTTMLatents": "WanVideo Add TTMLatents",
+    "AlignVidConfig": "AlignVid Config",
+    "ApplyAlignVid": "Apply AlignVid",
+    "AlignVidPresets": "AlignVid Presets",
 }
