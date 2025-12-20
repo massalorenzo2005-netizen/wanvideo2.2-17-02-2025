@@ -633,15 +633,15 @@ class WanT2VCrossAttention(WanSelfAttention):
     def forward(self, x, context, grid_sizes=None, clip_embed=None, audio_proj=None, audio_scale=1.0,
                 num_latent_frames=21, nag_params={}, nag_context=None, rope_func="comfy",
                 inner_t=None, inner_c=None, cross_freqs=None,
-                adapter_proj=None, adapter_attn_mask=None, ip_scale=1.0, orig_seq_len=None, lynx_x_ip=None, lynx_ip_scale=1.0, num_cond_latents=None, **kwargs):
+                adapter_proj=None, adapter_attn_mask=None, ip_scale=1.0, orig_seq_len=None, lynx_x_ip=None, lynx_ip_scale=1.0, longcat_num_cond_latents=None, **kwargs):
         b, n, d = x.size(0), self.num_heads, self.head_dim
         s = x.size(1)
         # compute query
         is_longcat = x.shape[-1] == 4096
 
         if is_longcat:
-            if num_cond_latents is not None and num_cond_latents > 0:
-                num_cond_latents_thw = num_cond_latents * (s // num_latent_frames)
+            if longcat_num_cond_latents is not None and longcat_num_cond_latents > 0:
+                num_cond_latents_thw = longcat_num_cond_latents * (s // num_latent_frames)
                 x = x[:, num_cond_latents_thw:]
             q = self.norm_q(self.q(x).view(b, -1, n, d))
         else:
@@ -712,7 +712,7 @@ class WanT2VCrossAttention(WanSelfAttention):
 
             x = x.add(target_x)
 
-        if is_longcat and num_cond_latents is not None and num_cond_latents > 0:
+        if is_longcat and longcat_num_cond_latents > 0:
             return torch.cat([torch.zeros((b, num_cond_latents_thw, x.shape[-1]), dtype=x.dtype, device=x.device), self.o(x)], dim=1).contiguous()
 
         return self.o(x)
@@ -914,7 +914,7 @@ class WanAttentionBlock(nn.Module):
             from ...LongCat.layers import FeedForwardSwiGLU
             mlp_ratio = 4
             self.ffn = FeedForwardSwiGLU(dim=self.dim, hidden_dim=int(self.dim * mlp_ratio))
-        
+
         # modulation
         if not is_longcat:
             self.modulation = nn.Parameter(torch.randn(1, 6, out_features) / in_features**0.5)
@@ -1003,7 +1003,7 @@ class WanAttentionBlock(nn.Module):
         humo_audio_input=None, humo_audio_scale=1.0, #humo audio
         lynx_x_ip=None, lynx_ref_feature=None, lynx_ip_scale=1.0, lynx_ref_scale=1.0, #lynx
         x_ovi=None, e_ovi=None, freqs_ovi=None, context_ovi=None, seq_lens_ovi=None, grid_sizes_ovi=None,
-        num_cond_latents=None, #longcat image cond amount
+        longcat_num_cond_latents=0, #longcat image cond amount
         x_onetoall_ref=None, onetoall_freqs=None, onetoall_ref=None, onetoall_ref_scale=1.0, #one-to-all
         e_tr=None, tr_num=0, tr_start=0, #token replacement
     ):
@@ -1030,7 +1030,7 @@ class WanAttentionBlock(nn.Module):
             tr_end = tr_start + (tr_num or 0)
 
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.get_mod(e.to(x.device), self.modulation)
-        del e
+        #del e
         input_dtype = x.dtype
         B, N, C = x.shape
         T = num_latent_frames
@@ -1181,18 +1181,64 @@ class WanAttentionBlock(nn.Module):
             full_k = torch.cat([k, k_ip], dim=1)
             full_v = torch.cat([v, v_ip], dim=1)
             y = self.self_attn.forward(q, full_k, full_v, seq_lens)
-        elif is_longcat and num_cond_latents is not None and num_cond_latents > 0:
-            num_cond_latents_thw = num_cond_latents * (N // num_latent_frames)
-            # process the condition tokens
-            x_cond = self.self_attn.forward(
-                q[:, :num_cond_latents_thw].contiguous(),
-                k[:, :num_cond_latents_thw].contiguous(),
-                v[:, :num_cond_latents_thw].contiguous(),
-                seq_lens)
-            # process the noise tokens
-            x_noise = self.self_attn.forward(q[:, num_cond_latents_thw:].contiguous(), k, v, seq_lens)
-            # merge x_cond and x_noise
-            y = torch.cat([x_cond, x_noise], dim=1).contiguous()
+        elif is_longcat and longcat_num_cond_latents > 0:
+            if longcat_num_cond_latents == 1:
+                num_cond_latents_thw = longcat_num_cond_latents * (N // num_latent_frames)
+                # process the condition tokens
+                x_cond = self.self_attn.forward(
+                    q[:, :num_cond_latents_thw].contiguous(),
+                    k[:, :num_cond_latents_thw].contiguous(),
+                    v[:, :num_cond_latents_thw].contiguous(),
+                    seq_lens)
+                # process the noise tokens
+                x_noise = self.self_attn.forward(q[:, num_cond_latents_thw:].contiguous(), k, v, seq_lens)
+                # merge x_cond and x_noise
+                y = torch.cat([x_cond, x_noise], dim=1).contiguous()
+            elif longcat_num_cond_latents > 1: # video continuation
+                num_ref_latents_thw = (N // num_latent_frames)
+                num_cond_latents_thw = longcat_num_cond_latents * (N // num_latent_frames)
+                # process the condition tokens
+                q_ref = q[:, :num_ref_latents_thw].contiguous()
+                k_ref = k[:, :num_ref_latents_thw].contiguous()
+                v_ref = v[:, :num_ref_latents_thw].contiguous()
+                q_cond = q[:, num_ref_latents_thw:num_cond_latents_thw].contiguous()
+                k_cond = k[:, num_ref_latents_thw:num_cond_latents_thw].contiguous()
+                v_cond = v[:, num_ref_latents_thw:num_cond_latents_thw].contiguous()
+                x_ref = self.self_attn.forward(q_ref, k_ref, v_ref, seq_lens)
+                x_cond = self.self_attn.forward(q_cond, k_cond, v_cond, seq_lens)
+                if longcat_num_cond_latents == num_latent_frames:
+                    y = torch.cat([x_ref, x_cond], dim=1).contiguous()
+                else:
+                    # process the noise tokens
+                    q_noise = q[:, num_cond_latents_thw:].contiguous()
+                    start_noise, end_noise, num_noisy_frames = 0, 0, num_latent_frames - longcat_num_cond_latents
+                    mask_frame_range = 3 #todo: make it configurable?
+                    ref_img_index = 10 #todo: make it configurable?
+                    num_ref_latents = 1 # todo: make it configurable?
+                    if mask_frame_range is not None and mask_frame_range > 0:
+                        start_noise = ref_img_index - mask_frame_range - longcat_num_cond_latents + num_ref_latents
+                        end_noise   = ref_img_index + mask_frame_range - longcat_num_cond_latents + num_ref_latents + 1
+
+                    if start_noise >= 0 and end_noise > start_noise and end_noise <= num_noisy_frames:
+                        # remove attention with the reference image in the target range, preventing repeated actions.
+
+                        start_pos = start_noise * (N // num_latent_frames)
+                        end_pos   = end_noise * (N // num_latent_frames)
+
+                        q_noise_front = q_noise[:, :start_pos].contiguous()
+                        q_noise_maskref = q_noise[:, start_pos:end_pos].contiguous()
+                        q_noise_back = q_noise[:, end_pos:].contiguous()
+                        k_non_ref = k[:, num_ref_latents_thw:].contiguous()
+                        v_non_ref = v[:, num_ref_latents_thw:].contiguous()
+
+                        x_noise_front = self.self_attn.forward(q_noise_front, k, v, seq_lens) # q_front has attention with ref + cond + noisy
+                        x_noise_back = self.self_attn.forward(q_noise_back, k, v, seq_lens) # q_back has attention with ref + cond + noisy
+                        x_noise_maskref = self.self_attn.forward(q_noise_maskref, k_non_ref, v_non_ref, seq_lens) # q_mask has attention with cond+noisy
+                        x_noise = torch.cat([x_noise_front, x_noise_maskref, x_noise_back], dim=1).contiguous()
+                    else:
+                        x_noise = self.self_attn.forward(q_noise, k, v, seq_lens)
+                    # merge x_cond and x_noise
+                    y = torch.cat([x_ref, x_cond, x_noise], dim=1).contiguous()
         else:
             y = self.self_attn.forward(q, k, v, seq_lens, lynx_ref_feature=lynx_ref_feature, lynx_ref_scale=lynx_ref_scale, onetoall_ref=onetoall_ref, onetoall_ref_scale=onetoall_ref_scale)
 
@@ -1263,12 +1309,23 @@ class WanAttentionBlock(nn.Module):
                 x = x + self.cross_attn(self.norm3(x.to(self.norm3.weight.dtype)).to(input_dtype), context, grid_sizes, clip_embed=clip_embed, audio_proj=audio_proj, audio_scale=audio_scale,
                                     num_latent_frames=num_latent_frames, nag_params=nag_params, nag_context=nag_context,
                                     rope_func=self.rope_func, inner_t=inner_t, inner_c=inner_c, cross_freqs=cross_freqs,
-                                    adapter_proj=adapter_proj, ip_scale=ip_scale, orig_seq_len=original_seq_len, lynx_x_ip=lynx_x_ip, lynx_ip_scale=lynx_ip_scale, num_cond_latents=num_cond_latents)
+                                    adapter_proj=adapter_proj, ip_scale=ip_scale, orig_seq_len=original_seq_len, lynx_x_ip=lynx_x_ip, lynx_ip_scale=lynx_ip_scale, longcat_num_cond_latents=longcat_num_cond_latents)
                 x = x.to(input_dtype)
                 # MultiTalk
                 if multitalk_audio_embedding is not None and not isinstance(self, VaceWanAttentionBlock):
-                    x_audio = self.audio_cross_attn(self.norm_x(x.to(self.norm_x.weight.dtype)).to(input_dtype), encoder_hidden_states=multitalk_audio_embedding,
-                                                shape=grid_sizes[0], x_ref_attn_map=x_ref_attn_map, human_num=human_num)
+
+                    if is_longcat:
+                        audio_output_cond, x_audio = self.audio_cross_attn(self.norm_x(x.to(self.norm_x.weight.dtype)).to(input_dtype), multitalk_audio_embedding, num_latent_frames=num_latent_frames,
+                                                        num_cond_latents=longcat_num_cond_latents, x_ref_attn_map=x_ref_attn_map, human_num=human_num)
+
+                        audio_shift_mca, audio_scale_mca, audio_gate_mca = self.audio_modulation(e[:, longcat_num_cond_latents:]).unsqueeze(2).chunk(3, dim=-1) # [B, T, 1, C]
+                        x_audio = self.modulate(self.norm1(x_audio.view(B, T-longcat_num_cond_latents, -1, C).to(audio_shift_mca.dtype)), audio_shift_mca, audio_scale_mca, seg_idx=self.seg_idx).to(input_dtype).view(B, -1, C)
+                        x_audio = (x_audio.view(B, T-longcat_num_cond_latents, -1, C).float() * audio_gate_mca).to(input_dtype).view(B, -1, C)
+                        if audio_output_cond is not None:
+                            x_audio = torch.cat([audio_output_cond, x_audio], dim=1).contiguous()
+                    else:
+                        x_audio = self.audio_cross_attn(self.norm_x(x.to(self.norm_x.weight.dtype)).to(input_dtype), encoder_hidden_states=multitalk_audio_embedding,
+                                                    shape=grid_sizes[0], x_ref_attn_map=x_ref_attn_map, human_num=human_num)
                     x = x.add(x_audio, alpha=audio_scale)
 
                 # MTV-Crafter Motion Attention
@@ -1282,7 +1339,7 @@ class WanAttentionBlock(nn.Module):
 
 
         # ffn
-        if self.rope_func == "comfy_chunked":
+        if self.rope_func == "comfy_chunked" and not is_longcat and not use_token_replace and not zero_timestep:
             mod_x = torch.addcmul(shift_mlp, self.norm2(x.to(shift_mlp.dtype)), 1 + scale_mlp)
             x_ffn = self.ffn_chunked(mod_x)
         else:
@@ -2128,7 +2185,8 @@ class WanModel(torch.nn.Module):
 
 
     def rope_encode_comfy(self, t, h, w, freq_offset=0, t_start=0, ref_frame_shape=None, pose_frame_shape=None,
-                          steps_t=None, steps_h=None, steps_w=None, ntk_alphas=[1,1,1], device=None, dtype=None):
+                          steps_t=None, steps_h=None, steps_w=None, ntk_alphas=[1,1,1], device=None, dtype=None,
+                          ref_frame_index=10, longcat_num_ref_latents=None):
 
         patch_size = self.patch_size
         t_len = ((t + (patch_size[0] // 2)) // patch_size[0])
@@ -2144,7 +2202,19 @@ class WanModel(torch.nn.Module):
 
         # Main frames position IDs
         img_ids = torch.zeros((steps_t, steps_h, steps_w, 3), device=device, dtype=dtype)
-        img_ids[:, :, :, 0] = img_ids[:, :, :, 0] + torch.linspace(t_start+freq_offset, t_start + (t_len - 1), steps=steps_t, device=device, dtype=dtype).reshape(-1, 1, 1)
+
+        if longcat_num_ref_latents > 0:
+            # Create temporal grid with ref_frame_index prepended, followed by sequential frames
+            grid_t = torch.cat([
+                torch.tensor([ref_frame_index], dtype=dtype, device=device),
+                torch.arange(0, steps_t - longcat_num_ref_latents, dtype=dtype, device=device)
+            ], dim=0)
+            print("grid_t:", grid_t)
+            img_ids[:, :, :, 0] = img_ids[:, :, :, 0] + grid_t.reshape(-1, 1, 1)
+        else:
+            # Standard temporal encoding
+            img_ids[:, :, :, 0] = img_ids[:, :, :, 0] + torch.linspace(t_start+freq_offset, t_start + (t_len - 1), steps=steps_t, device=device, dtype=dtype).reshape(-1, 1, 1)
+
         img_ids[:, :, :, 1] = img_ids[:, :, :, 1] + torch.linspace(freq_offset, h_len - 1, steps=steps_h, device=device, dtype=dtype).reshape(1, -1, 1)
         img_ids[:, :, :, 2] = img_ids[:, :, :, 2] + torch.linspace(freq_offset, w_len - 1, steps=steps_w, device=device, dtype=dtype).reshape(1, 1, -1)
         img_ids = img_ids.reshape(1, -1, img_ids.shape[-1])
@@ -2243,7 +2313,7 @@ class WanModel(torch.nn.Module):
         lynx_embeds=None,
         x_ovi=None, seq_len_ovi=None, ovi_negative_text_embeds=None,
         flashvsr_LQ_latent=None, flashvsr_strength=1.0,
-        num_cond_latents=None,
+        longcat_num_cond_latents=0, longcat_num_ref_latents=0, # for LongCat
         add_text_emb=None,
         sdancer_input=None,  # SteadyDancer
         one_to_all_input=None, one_to_all_controlnet_strength=0.0, # One-to-All
@@ -2331,6 +2401,7 @@ class WanModel(torch.nn.Module):
            freqs = freqs.to(device)
 
         _, F, H, W = x[0].shape
+        print("Input shape:", x[0].shape)
         ref_frame_shape = pose_frame_shape = None
 
         sdancer_enabled = False
@@ -2558,6 +2629,7 @@ class WanModel(torch.nn.Module):
                 tuple(pose_frame_shape) if pose_frame_shape is not None else None,
                 self.rope_embedder.k,
                 tuple(ntk_alphas),
+                longcat_num_ref_latents,
             )
 
             # Check cache using key comparison
@@ -2573,6 +2645,7 @@ class WanModel(torch.nn.Module):
                     ntk_alphas=ntk_alphas,
                     ref_frame_shape=ref_frame_shape,
                     pose_frame_shape=pose_frame_shape,
+                    longcat_num_ref_latents=longcat_num_ref_latents,
                     device=x.device,
                     dtype=x.dtype
                 )
@@ -2636,14 +2709,19 @@ class WanModel(torch.nn.Module):
                 e_token_replace = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t_token_replace.flatten()).to(time_embed_dtype))  # b, dim
                 e0_token_replace = self.time_projection(e_token_replace).unflatten(1, (6, self.dim))  # b, 6, dim
         else:
+            print("input t shape:", t.shape)
+            print("F:", F)
             time_embed_dtype = self.time_embedding.mlp[0].weight.dtype
             if time_embed_dtype not in [torch.float16, torch.bfloat16, torch.float32]:
                 time_embed_dtype = self.base_dtype
             if len(t.shape) == 1:
                 t = t.unsqueeze(1).expand(-1, F) # [B, T]
+            print("t expanded shape:", t.shape)
             self.time_embedding.to(torch.float32)
-            e = e0 = self.time_embedding(t.float().flatten(), dtype=torch.float32).reshape(1, F, -1)
-
+            print("t float shape:", t.float().flatten().shape)
+            e = e0 = self.time_embedding(t.float().flatten(), dtype=torch.float32)#.reshape(1, F, -1)
+            print("e0 shape:", e0.shape)
+            e = e0 = e0.reshape(1, F, -1)
 
         if self.audio_model is not None:
             #if t.dim() == 1:
@@ -2778,10 +2856,26 @@ class WanModel(torch.nn.Module):
             latter_middle_frame_audio_emb = latter_frame_audio_emb[:, :, 1:-1, middle_index:middle_index+1, ...] 
             latter_middle_frame_audio_emb = rearrange(latter_middle_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
             latter_frame_audio_emb_s = torch.concat([latter_first_frame_audio_emb, latter_middle_frame_audio_emb, latter_last_frame_audio_emb], dim=2) 
-            multitalk_audio_embedding = self.multitalk_audio_proj(first_frame_audio_emb_s, latter_frame_audio_emb_s) 
-            human_num = len(multitalk_audio_embedding)
-            multitalk_audio_embedding = torch.concat(multitalk_audio_embedding.split(1), dim=2).to(self.base_dtype)
+            multitalk_audio_embedding = self.multitalk_audio_proj(first_frame_audio_emb_s, latter_frame_audio_emb_s)
             self.multitalk_audio_proj.to(self.offload_device)
+            human_num = len(multitalk_audio_embedding)
+
+            # LongCat-Avatar specific
+            print("longcat_num_cond_latents:", longcat_num_cond_latents, "longcat_num_ref_latents:", longcat_num_ref_latents)
+
+            if longcat_num_ref_latents > 0:
+                audio_start_ref = multitalk_audio_embedding[:, [0], :, :] # padding
+                multitalk_audio_embedding = torch.cat([audio_start_ref, multitalk_audio_embedding], dim=1).contiguous()
+
+            if longcat_num_cond_latents > 0:
+                multitalk_audio_embedding = multitalk_audio_embedding[:, (-F // self.patch_size[0]):]
+
+            if ref_target_masks is not None:
+                multitalk_audio_embedding = torch.concat(multitalk_audio_embedding.split(1), dim=2).to(self.base_dtype)
+                multitalk_audio_embedding = multitalk_audio_embedding.squeeze(0)
+            else:
+                multitalk_audio_embedding = rearrange(multitalk_audio_embedding, "b t n c -> (b t) n c")
+
 
         # convert ref_target_masks to token_ref_target_masks
         token_ref_target_masks = None
@@ -2975,7 +3069,7 @@ class WanModel(torch.nn.Module):
                 lynx_x_ip=lynx_x_ip,
                 lynx_ip_scale=lynx_ip_scale,
                 lynx_ref_scale=lynx_ref_scale,
-                num_cond_latents=num_cond_latents,
+                longcat_num_cond_latents=longcat_num_cond_latents,
                 onetoall_ref_scale=onetoall_ref_scale,
                 e_tr=e0_token_replace if use_token_replace else None,
                 tr_start=token_replace_start,

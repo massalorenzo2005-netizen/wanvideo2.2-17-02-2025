@@ -2046,7 +2046,7 @@ class WanVideoDecode:
             video.clamp_(-1.0, 1.0)
             video.add_(1.0).div_(2.0)
             return video.cpu().float(),
-        latents = samples["samples"]
+        latents = samples["samples"].clone()
         end_image = samples.get("end_image", None)
         has_ref = samples.get("has_ref", False)
         drop_last = samples.get("drop_last", False)

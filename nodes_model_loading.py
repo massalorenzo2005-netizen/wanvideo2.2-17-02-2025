@@ -1466,6 +1466,39 @@ class WanVideoModelLoader:
 
             sd.update(extra_sd)
             del extra_sd
+        elif "multitalk_audio_proj.proj1.weight" in sd:
+            log.info("MultiTalk/InfiniteTalk model detected, patching model...")
+            from .multitalk.multitalk import AudioProjModel
+            from .wanvideo.modules.model import WanLayerNorm
+            from .LongCat.layers import SingleStreamAttention
+
+            audio_window = 5
+            vae_scale = 4
+
+            for block in transformer.blocks:
+                with init_empty_weights():
+                    if "blocks.0.audio_modulation.1.weight" in sd:
+                        block.audio_modulation = nn.Sequential(nn.SiLU(), nn.Linear(512, 3 * dim, bias=True))
+                    block.norm_x = WanLayerNorm(dim, transformer.eps, elementwise_affine=True)
+                    block.audio_cross_attn = SingleStreamAttention(
+                            dim=dim,
+                            encoder_hidden_states_dim=768,
+                            num_heads=num_heads,
+                        qkv_bias=True,
+                        qk_norm=True,
+                        class_range=24,
+                        class_interval=4,
+                        attention_mode=attention_mode,
+                    )
+                    multitalk_proj_model = AudioProjModel(
+                            seq_len=audio_window,
+                            seq_len_vf=audio_window+vae_scale-1,
+                            intermediate_dim=512,
+                            output_dim=768,
+                            context_tokens=32,
+                            norm_output_audio=True,
+                    )
+            transformer.multitalk_audio_proj = multitalk_proj_model
 
         # FlashVSR
         if "LQ_proj_in.norm1.gamma" in sd:
