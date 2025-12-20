@@ -1408,7 +1408,7 @@ class WanVideoModelLoader:
             sd.update(fantasytalking_model["sd"])
 
         # FantasyPortrait https://github.com/Fantasy-AMAP/fantasy-portrait/
-        if fantasyportrait_model is not None:
+        if fantasyportrait_model is not None and "blocks.0.cross_attn.emo_k_proj.weight" not in sd:
             log.info("FantasyPortrait model detected, patching model...")
             context_dim = fantasyportrait_model["sd"]["ip_adapter.blocks.0.cross_attn.ip_adapter_single_stream_k_proj.weight"].shape[1]
 
@@ -1422,6 +1422,19 @@ class WanVideoModelLoader:
                     ip_adapter_sd[k.replace("ip_adapter.", "")] = v
             sd.update(ip_adapter_sd)
             del ip_adapter_sd
+
+        # FlashPortrait
+        if "blocks.0.cross_attn.emo_k_proj.weight" in sd:
+            log.info("FlashPortrait model detected, patching model...")
+            context_dim = sd["blocks.0.cross_attn.emo_k_proj.weight"].shape[1]
+
+            sd = {k.replace("emo_k_proj", "ip_adapter_single_stream_k_proj"): v for k, v in sd.items()}
+            sd = {k.replace("emo_v_proj", "ip_adapter_single_stream_v_proj"): v for k, v in sd.items()}
+
+            with init_empty_weights():
+                for block in transformer.blocks:
+                    block.cross_attn.ip_adapter_single_stream_k_proj = nn.Linear(context_dim, dim, bias=False)
+                    block.cross_attn.ip_adapter_single_stream_v_proj = nn.Linear(context_dim, dim, bias=False)
 
         if multitalk_model is not None:
             multitalk_model_type = multitalk_model.get("model_type", "MultiTalk")
