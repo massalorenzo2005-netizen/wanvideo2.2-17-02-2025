@@ -2401,7 +2401,6 @@ class WanModel(torch.nn.Module):
            freqs = freqs.to(device)
 
         _, F, H, W = x[0].shape
-        print("Input shape:", x[0].shape)
         ref_frame_shape = pose_frame_shape = None
 
         sdancer_enabled = False

@@ -1408,7 +1408,6 @@ class WanVideoSampler:
 
                 multitalk_audio_input = None
                 if audio_emb_slice is not None:
-                    print("audio_emb_slice shape: ", audio_emb_slice.shape)
                     multitalk_audio_input = audio_emb_slice.to(z)
                 elif not multitalk_sampling and multitalk_audio_embeds is not None:
                     audio_embedding = multitalk_audio_embeds
