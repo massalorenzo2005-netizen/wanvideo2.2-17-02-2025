@@ -879,8 +879,9 @@ class WanVideoSampler:
         longcat_ref_latent = None
         longcat_avatar_options = image_embeds.get("longcat_avatar_options", None)
         if longcat_avatar_options is not None:
-            longcat_ref_latent = image_embeds.get("longcat_ref_latent", None)
+            longcat_ref_latent = longcat_avatar_options.get("longcat_ref_latent", None)
             if longcat_ref_latent is not None:
+                log.info(f"LongCat-Avatar reference latent shape: {longcat_ref_latent.shape}")
                 latent = torch.cat([longcat_ref_latent.to(latent), latent], dim=1)
                 seq_len = math.ceil((latent.shape[2] * latent.shape[3]) / 4 * latent.shape[1])
                 insert_len = longcat_ref_latent.shape[1]
