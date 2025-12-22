@@ -2278,14 +2278,7 @@ class WanVideoSampler:
                         uni3c_data = uni3c_data_input = None
                         if uni3c_embeds is not None:
                             transformer.controlnet = uni3c_embeds["controlnet"]
-                            uni3c_data = {
-                                "render_latent": uni3c_embeds["render_latent"],
-                                "render_mask": uni3c_embeds["render_mask"],
-                                "camera_embedding": uni3c_embeds["camera_embedding"],
-                                "controlnet_weight": uni3c_embeds["controlnet_weight"],
-                                "start": uni3c_embeds["start"],
-                                "end": uni3c_embeds["end"],
-                            }
+                            uni3c_data = uni3c_embeds.copy()
 
                         encoded_silence = None
 
