@@ -123,7 +123,7 @@ class SingleStreamAttention(nn.Module):
         q = self.q_linear(x)
         q_shape = (B, N, self.num_heads, self.head_dim)
         q = q.view(q_shape).permute((0, 2, 1, 3)) # [B, H, N, D]
-        q = self.q_norm(q)
+        q = self.q_norm(q.to(self.q_norm.weight.dtype)).to(q.dtype)
 
         # multitalk with rope1d pe
         if x_ref_attn_map is not None:
@@ -151,7 +151,7 @@ class SingleStreamAttention(nn.Module):
         encoder_kv = encoder_kv.view(encoder_kv_shape).permute((2, 0, 3, 1, 4))
 
         encoder_k, encoder_v = encoder_kv.unbind(0)
-        encoder_k = self.k_norm(encoder_k)
+        encoder_k = self.k_norm(encoder_k.to(self.k_norm.weight.dtype)).to(encoder_k.dtype)
 
 
         # multitalk with rope1d pe
