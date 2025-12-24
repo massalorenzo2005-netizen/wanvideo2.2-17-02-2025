@@ -2723,12 +2723,10 @@ class WanModel(torch.nn.Module):
         # Stand-In RoPE frequencies
         if x_ip is not None:
             # Generate RoPE frequencies for x_ip
-            h_len = (H + 1) // 2
-            w_len = (W + 1) // 2
             ip_img_ids = torch.zeros((f_ip, h_ip, w_ip, 3), device=x.device, dtype=x.dtype)
-            ip_img_ids[:, :, :, 0] = ip_img_ids[:, :, :, 0] + torch.linspace(0, f_ip - 1, steps=f_ip, device=x.device, dtype=x.dtype).reshape(-1, 1, 1)
-            ip_img_ids[:, :, :, 1] = ip_img_ids[:, :, :, 1] + torch.linspace(h_len + freq_offset, h_len + freq_offset + h_ip - 1, steps=h_ip, device=x.device, dtype=x.dtype).reshape(1, -1, 1)
-            ip_img_ids[:, :, :, 2] = ip_img_ids[:, :, :, 2] + torch.linspace(w_len + freq_offset, w_len + freq_offset + w_ip - 1, steps=w_ip, device=x.device, dtype=x.dtype).reshape(1, 1, -1)
+            ip_img_ids[:, :, :, 0] = -1
+            ip_img_ids[:, :, :, 1] = ip_img_ids[:, :, :, 1] + torch.linspace(h + freq_offset, h + freq_offset + (h_ip - 1), steps=h_ip, device=x.device, dtype=x.dtype).reshape(1, -1, 1)
+            ip_img_ids[:, :, :, 2] = ip_img_ids[:, :, :, 2] + torch.linspace(w + freq_offset, w + freq_offset + (w_ip - 1), steps=w_ip, device=x.device, dtype=x.dtype).reshape(1, 1, -1)
             ip_img_ids = repeat(ip_img_ids, "t h w c -> b (t h w) c", b=1)
             freqs_ip = self.rope_embedder(ip_img_ids).movedim(1, 2)
 
@@ -2770,8 +2768,8 @@ class WanModel(torch.nn.Module):
             if len(t.shape) == 1:
                 t = t.unsqueeze(1).expand(-1, F) # [B, T]
             self.time_embedding.to(torch.float32)
-            e = e0 = self.time_embedding(t.float().flatten(), dtype=torch.float32).reshape(1, F, -1)
-
+            e = e0 = self.time_embedding(t.float().flatten(), dtype=torch.float32)#.reshape(1, F, -1)
+            e = e0 = e0.reshape(1, F, -1)
 
         if self.audio_model is not None:
             #if t.dim() == 1:
@@ -2906,10 +2904,24 @@ class WanModel(torch.nn.Module):
             latter_middle_frame_audio_emb = latter_frame_audio_emb[:, :, 1:-1, middle_index:middle_index+1, ...] 
             latter_middle_frame_audio_emb = rearrange(latter_middle_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
             latter_frame_audio_emb_s = torch.concat([latter_first_frame_audio_emb, latter_middle_frame_audio_emb, latter_last_frame_audio_emb], dim=2) 
-            multitalk_audio_embedding = self.multitalk_audio_proj(first_frame_audio_emb_s, latter_frame_audio_emb_s) 
-            human_num = len(multitalk_audio_embedding)
-            multitalk_audio_embedding = torch.concat(multitalk_audio_embedding.split(1), dim=2).to(self.base_dtype)
+            multitalk_audio_embedding = self.multitalk_audio_proj(first_frame_audio_emb_s, latter_frame_audio_emb_s)
             self.multitalk_audio_proj.to(self.offload_device)
+            human_num = len(multitalk_audio_embedding)
+
+            # LongCat-Avatar specific
+            if longcat_num_ref_latents > 0:
+                audio_start_ref = multitalk_audio_embedding[:, [0], :, :] # padding
+                multitalk_audio_embedding = torch.cat([audio_start_ref, multitalk_audio_embedding], dim=1).contiguous()
+
+            if longcat_num_cond_latents > 0:
+                multitalk_audio_embedding = multitalk_audio_embedding[:, (-F // self.patch_size[0]):]
+
+            if ref_target_masks is not None:
+                multitalk_audio_embedding = torch.concat(multitalk_audio_embedding.split(1), dim=2).to(self.base_dtype)
+                multitalk_audio_embedding = multitalk_audio_embedding.squeeze(0)
+            else:
+                multitalk_audio_embedding = rearrange(multitalk_audio_embedding, "b t n c -> (b t) n c")
+
 
         # convert ref_target_masks to token_ref_target_masks
         token_ref_target_masks = None
