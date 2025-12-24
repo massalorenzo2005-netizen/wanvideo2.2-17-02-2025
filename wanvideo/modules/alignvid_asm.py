@@ -57,8 +57,8 @@ class AlignVidScheduler:
         total_steps: int = 25,
         scale_queries: bool = False,
         scale_keys: bool = True,
-        energy_low: float=1.0,
-        energy_high: float=2.0,
+        energy_low: float = 1.0,
+        energy_high: float = 2.0,
     ):
         """
         Args:
@@ -72,7 +72,7 @@ class AlignVidScheduler:
             t_low, t_high: SGS active interval [t_low, t_high] (0-based indexing).
             total_steps: total diffusion steps T.
             scale_queries / scale_keys: s_Q, s_K in Eq. (15) with s_Q + s_K = 1. [web:20]
-            energy_low, energy_high: range for sigmoid rescaling.
+            energy_low / energy_high: range for sigmoid rescaling (Eq. 10).
         """
         self.num_blocks = num_blocks
         self.bgs_mode = bgs_mode
