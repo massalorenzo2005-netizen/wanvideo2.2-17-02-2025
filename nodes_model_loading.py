@@ -178,7 +178,7 @@ def standardize_lora_key_format(lora_sd):
 
                         new_key += f".{component}"
 
-                # Handle weight type - this is the critical fix
+                # Handle weight type
                 if weight_type:
                     if weight_type == 'alpha':
                         new_key += '.alpha'
@@ -209,12 +209,12 @@ def standardize_lora_key_format(lora_sd):
                 new_key = new_key.replace('time_embedding', 'time.embedding')
                 new_key = new_key.replace('time_projection', 'time.projection')
 
-                # Replace remaining underscores with dots, carefully
+                # Replace remaining underscores with dots
                 parts = new_key.split('.')
                 final_parts = []
                 for part in parts:
                     if part in ['img_emb', 'self_attn', 'cross_attn']:
-                        final_parts.append(part)  # Keep these intact
+                        final_parts.append(part)
                     else:
                         final_parts.append(part.replace('_', '.'))
                 new_key = '.'.join(final_parts)
@@ -272,6 +272,20 @@ def standardize_lora_key_format(lora_sd):
         if "txt_attn.qkv" in k:
             k = k.replace("txt_attn.qkv", "txt_attn_qkv")
         new_sd[k] = v
+    return new_sd
+
+def compensate_rs_lora_format(lora_sd):
+    rank = lora_sd["base_model.model.blocks.0.cross_attn.k.lora_A.weight"].shape[0]
+    alpha = torch.tensor(2 * 128 * rank ** 0.5)
+    log.info(f"Detected rank stabilized peft lora format with rank {rank}, setting alpha to {alpha} to compensate.")
+    new_sd = {}
+    for k, v in lora_sd.items():
+        if k.endswith(".lora_A.weight"):
+            new_sd[k] = v
+            new_k = k.replace(".lora_A.weight", ".alpha")
+            new_sd[new_k] = alpha
+        else:
+            new_sd[k] = v
     return new_sd
 
 class WanVideoBlockSwap:
@@ -756,6 +770,8 @@ class WanVideoSetLoRAs:
             lora_sd = load_torch_file(lora_path, safe_load=True)
             if "dwpose_embedding.0.weight" in lora_sd: #unianimate
                 raise NotImplementedError("Unianimate LoRA patching is not implemented in this node.")
+            if "base_model.model.blocks.0.cross_attn.k.lora_A.weight" in lora_sd: # assume rs_lora
+                lora_sd = compensate_rs_lora_format(lora_sd)
 
             lora_sd = standardize_lora_key_format(lora_sd)
             if l["blocks"]:
@@ -967,7 +983,8 @@ def add_lora_weights(patcher, lora, base_dtype, merge_loras=False):
             from .unianimate.nodes import update_transformer
             log.info("Unianimate LoRA detected, patching model...")
             patcher.model.diffusion_model, unianimate_sd = update_transformer(patcher.model.diffusion_model, lora_sd)
-
+        if "base_model.model.blocks.0.cross_attn.k.lora_A.weight" in lora_sd: # assume rs_lora
+                lora_sd = compensate_rs_lora_format(lora_sd)
         lora_sd = standardize_lora_key_format(lora_sd)
 
         if l["blocks"]:
