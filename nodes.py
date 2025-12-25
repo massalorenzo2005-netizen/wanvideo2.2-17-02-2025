@@ -892,8 +892,9 @@ class WanVideoAddStoryMemLatents:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
+                    "vae": ("WANVAE",),
                     "embeds": ("WANVIDIMAGE_EMBEDS",),
-                    "memory_latents": ("LATENT",),
+                    "memory_images": ("IMAGE",),
                 }
         }
 
@@ -902,11 +903,10 @@ class WanVideoAddStoryMemLatents:
     FUNCTION = "add"
     CATEGORY = "WanVideoWrapper"
 
-    def add(self, embeds, memory_latents):
+    def add(self, vae, embeds, memory_images):
         updated = dict(embeds)
-        samples = memory_latents["samples"][0]
-        updated["story_mem_latents"] = samples
-
+        story_mem_latents, = WanVideoEncodeLatentBatch().encode(vae, memory_images)
+        updated["story_mem_latents"] = story_mem_latents["samples"].squeeze(2).permute(1, 0, 2, 3)  # [C, T, H, W]
         return (updated,)
 
 #region I2V encode
@@ -2143,7 +2143,7 @@ class WanVideoEncodeLatentBatch:
     CATEGORY = "WanVideoWrapper"
     DESCRIPTION = "Encodes a batch of images individually to create a latent video batch where each video is a single frame, useful for I2V init purposes, for example as multiple context window inits"
 
-    def encode(self, vae, images, enable_vae_tiling, tile_x, tile_y, tile_stride_x, tile_stride_y, latent_strength=1.0):
+    def encode(self, vae, images, enable_vae_tiling=False, tile_x=272, tile_y=272, tile_stride_x=144, tile_stride_y=128, latent_strength=1.0):
         vae.to(device)
 
         images = images.clone()
