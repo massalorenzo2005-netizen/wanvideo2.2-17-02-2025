@@ -276,7 +276,7 @@ def standardize_lora_key_format(lora_sd):
 
 def compensate_rs_lora_format(lora_sd):
     rank = lora_sd["base_model.model.blocks.0.cross_attn.k.lora_A.weight"].shape[0]
-    alpha = torch.tensor(2 * 128 * rank ** 0.5)
+    alpha = torch.tensor(rank * rank // rank ** 0.5)
     log.info(f"Detected rank stabilized peft lora format with rank {rank}, setting alpha to {alpha} to compensate.")
     new_sd = {}
     for k, v in lora_sd.items():
