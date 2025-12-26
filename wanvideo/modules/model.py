@@ -2703,7 +2703,7 @@ class WanModel(torch.nn.Module):
                     device=x.device,
                     dtype=x.dtype
                 )
-                log.info("Generated new RoPE frequencies")
+                tqdm.write("Generated new RoPE frequencies")
 
                 if s2v_ref_latent is not None:
                     freqs_ref = self.rope_encode_comfy(

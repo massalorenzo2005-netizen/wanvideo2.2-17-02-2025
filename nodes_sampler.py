@@ -599,12 +599,10 @@ class WanVideoSampler:
                 portrait_cfg = [portrait_cfg] * (steps + 1)
 
         # MiniMax Remover
-        minimax_latents = minimax_mask_latents = None
         minimax_latents = image_embeds.get("minimax_latents", None)
         minimax_mask_latents = image_embeds.get("minimax_mask_latents", None)
         if minimax_latents is not None:
-            log.info(f"minimax_latents: {minimax_latents.shape}")
-            log.info(f"minimax_mask_latents: {minimax_mask_latents.shape}")
+            log.info(f"minimax_latents: {minimax_latents.shape}, minimax_mask_latents: {minimax_mask_latents.shape}")
             minimax_latents = minimax_latents.to(device, dtype)
             minimax_mask_latents = minimax_mask_latents.to(device, dtype)
 
@@ -691,7 +689,7 @@ class WanVideoSampler:
         framepack = False
         s2v_audio_embeds = image_embeds.get("audio_embeds", None)
         if s2v_audio_embeds is not None:
-            log.info(f"Using S2V audio embeddings")
+            log.info("Using S2V audio embeddings")
             framepack = s2v_audio_embeds.get("enable_framepack", False)
             if framepack and context_options is not None:
                 raise ValueError("S2V framepack and context windows cannot be used at the same time")
@@ -1685,7 +1683,6 @@ class WanVideoSampler:
             log.info(f"Input sequence length: {seq_len}")
             log.info(f"Sampling {(latent_video_length-1) * 4 + 1} frames at {latent.shape[3]*vae_upscale_factor}x{latent.shape[2]*vae_upscale_factor} with {steps-ttm_start_step} steps")
 
-        intermediate_device = device
 
         # Differential diffusion prep
         masks = None
@@ -1826,8 +1823,8 @@ class WanVideoSampler:
                         enhance_enabled = True
                     #region context windowing
                     elif context_options is not None:
-                        counter = torch.zeros_like(latent_model_input, device=intermediate_device)
-                        noise_pred = torch.zeros_like(latent_model_input, device=intermediate_device)
+                        counter = torch.zeros_like(latent_model_input, device=device)
+                        noise_pred = torch.zeros_like(latent_model_input, device=device)
                         context_queue = list(context(idx, steps, latent_video_length, context_frames, context_stride, context_overlap))
                         fraction_per_context = 1.0 / len(context_queue)
                         context_pbar = ProgressBar(steps)
@@ -1857,13 +1854,12 @@ class WanVideoSampler:
                             else:
                                 positive = text_embeds["prompt_embeds"]
 
-                            partial_img_emb = None
-                            partial_control_latents = None
+                            partial_img_emb = partial_control_latents = None
                             if image_cond is not None:
-                                partial_img_emb = image_cond[:, c]
+                                partial_img_emb = image_cond[:, c].to(device)
                                 if c[0] != 0 and context_reference_latent is not None:
                                     if context_reference_latent.shape[0] == 1: #only single extra init latent
-                                        new_init_image = context_reference_latent[0, :, 0].to(intermediate_device)
+                                        new_init_image = context_reference_latent[0, :, 0].to(device)
                                         # Concatenate the first 4 channels of partial_img_emb with new_init_image to match the required shape
                                         partial_img_emb[:, 0] = torch.cat([image_cond[:4, 0], new_init_image], dim=0)
                                     elif context_reference_latent.shape[0] > 1:
@@ -1872,10 +1868,10 @@ class WanVideoSampler:
                                         extra_init_index = min(int(max(c) / section_size), num_extra_inits - 1)
                                         if context_options["verbose"]:
                                             log.info(f"extra init image index: {extra_init_index}")
-                                        new_init_image = context_reference_latent[extra_init_index, :, 0].to(intermediate_device)
+                                        new_init_image = context_reference_latent[extra_init_index, :, 0].to(device)
                                         partial_img_emb[:, 0] = torch.cat([image_cond[:4, 0], new_init_image], dim=0)
                                 else:
-                                    new_init_image = image_cond[:, 0].to(intermediate_device)
+                                    new_init_image = image_cond[:, 0].to(device)
                                     partial_img_emb[:, 0] = new_init_image
 
                                 if control_latents is not None:
@@ -1893,14 +1889,14 @@ class WanVideoSampler:
                                     if has_ref:
                                         if c[0] != 0 and context_reference_latent is not None:
                                             if context_reference_latent.shape[0] == 1: #only single extra init latent
-                                                partial_context[16:32, :1] = context_reference_latent[0, :, :1].to(intermediate_device)
+                                                partial_context[16:32, :1] = context_reference_latent[0, :, :1].to(device)
                                             elif context_reference_latent.shape[0] > 1:
                                                 num_extra_inits = context_reference_latent.shape[0]
                                                 section_size = (latent_video_length / num_extra_inits)
                                                 extra_init_index = min(int(max(c) / section_size), num_extra_inits - 1)
                                                 if context_options["verbose"]:
                                                     log.info(f"extra init image index: {extra_init_index}")
-                                                partial_context[16:32, :1] = context_reference_latent[extra_init_index, :, :1].to(intermediate_device)
+                                                partial_context[16:32, :1] = context_reference_latent[extra_init_index, :, :1].to(device)
                                         else:
                                             partial_context[:, 0] = vace_entry["context"][0][:, 0]
 
@@ -2479,7 +2475,7 @@ class WanVideoSampler:
                             noise_pred = torch.cat([noise_pred[:, latent_video_length - shift_idx:]] + [noise_pred[:, :latent_video_length - shift_idx]], dim=1)
                             shift_idx = (shift_idx + latent_skip) % latent_video_length
 
-                    latent = latent.to(intermediate_device)
+                    latent = latent.to(device)
 
                     if self.noise_front_pad_num > 0:
                         noise_pred = noise_pred[:, self.noise_front_pad_num:]
