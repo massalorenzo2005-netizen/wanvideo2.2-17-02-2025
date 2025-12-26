@@ -1847,33 +1847,7 @@ class WanVideoContextOptions:
         }
 
         return (context_options,)
-    
-    
-class WanVideoFlowEdit:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {"required": {
-                "source_embeds": ("WANVIDEOTEXTEMBEDS", ),
-                "skip_steps": ("INT", {"default": 4, "min": 0}),
-                "drift_steps": ("INT", {"default": 0, "min": 0}),
-                "drift_flow_shift": ("FLOAT", {"default": 3.0, "min": 1.0, "max": 30.0, "step": 0.01}),
-                "source_cfg": ("FLOAT", {"default": 6.0, "min": 0.0, "max": 30.0, "step": 0.01}),
-                "drift_cfg": ("FLOAT", {"default": 6.0, "min": 0.0, "max": 30.0, "step": 0.01}),
-            },
-            "optional": {
-                "source_image_embeds": ("WANVIDIMAGE_EMBEDS", ),
-            }
-        }
 
-    RETURN_TYPES = ("FLOWEDITARGS", )
-    RETURN_NAMES = ("flowedit_args",)
-    FUNCTION = "process"
-    CATEGORY = "WanVideoWrapper"
-    DESCRIPTION = "Flowedit options for WanVideo"
-
-    def process(self, **kwargs):
-        return (kwargs,)
-    
 class WanVideoLoopArgs:
     @classmethod
     def INPUT_TYPES(s):
@@ -2249,7 +2223,6 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoEnhanceAVideo": WanVideoEnhanceAVideo,
     "WanVideoContextOptions": WanVideoContextOptions,
     "WanVideoTextEmbedBridge": WanVideoTextEmbedBridge,
-    "WanVideoFlowEdit": WanVideoFlowEdit,
     "WanVideoControlEmbeds": WanVideoControlEmbeds,
     "WanVideoSLG": WanVideoSLG,
     "WanVideoLoopArgs": WanVideoLoopArgs,
@@ -2292,7 +2265,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoEnhanceAVideo": "WanVideo Enhance-A-Video",
     "WanVideoContextOptions": "WanVideo Context Options",
     "WanVideoTextEmbedBridge": "WanVideo TextEmbed Bridge",
-    "WanVideoFlowEdit": "WanVideo FlowEdit",
     "WanVideoControlEmbeds": "WanVideo Control Embeds",
     "WanVideoSLG": "WanVideo SLG",
     "WanVideoLoopArgs": "WanVideo Loop Args",
