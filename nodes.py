@@ -909,6 +909,64 @@ class WanVideoAddStoryMemLatents:
         updated["story_mem_latents"] = story_mem_latents["samples"].squeeze(2).permute(1, 0, 2, 3)  # [C, T, H, W]
         return (updated,)
 
+
+class WanVideoSVIProEmbeds:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                    "anchor_samples": ("LATENT", {"tooltip": "Initial start image encoded"}),
+                    "num_frames": ("INT", {"default": 81, "min": 1, "max": 10000, "step": 4, "tooltip": "Number of frames to encode"}),
+                },
+                "optional": {
+                    "prev_samples": ("LATENT", {"tooltip": "Last latent from previous generation"}),
+                    "motion_latent_count": ("INT", {"default": 2, "min": 1, "max": 100, "step": 1, "tooltip": "Number of latents used to continue"}),
+                }
+        }
+
+    RETURN_TYPES = ("WANVIDIMAGE_EMBEDS",)
+    RETURN_NAMES = ("image_embeds",)
+    FUNCTION = "add"
+    CATEGORY = "WanVideoWrapper"
+
+    def add(self, anchor_samples, num_frames, prev_samples=None, motion_latent_count=1):
+
+        anchor_latent = anchor_samples["samples"][0].clone()
+
+        C, T, H, W = anchor_latent.shape
+
+        total_latents = (num_frames - 1) // 4 + 1
+        device = anchor_latent.device
+        dtype = anchor_latent.dtype
+
+        if prev_samples is None or motion_latent_count == 0:
+            padding_size = total_latents - anchor_latent.shape[1]
+            padding = torch.zeros(C, padding_size, H, W, dtype=dtype, device=device)
+            y = torch.concat([anchor_latent, padding], dim=1)
+        else:
+            prev_latent = prev_samples["samples"][0].clone()
+            motion_latent = prev_latent[:, -motion_latent_count:]
+            padding_size = total_latents - anchor_latent.shape[1] - motion_latent.shape[1]
+            padding = torch.zeros(C, padding_size, H, W, dtype=dtype, device=device)
+            y = torch.concat([anchor_latent, motion_latent, padding], dim=1)
+
+        msk = torch.ones(1, num_frames, H, W, device=device, dtype=dtype)
+        msk[:, 1:] = 0
+        msk = torch.concat([torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]], dim=1)
+        msk = msk.view(1, msk.shape[1] // 4, 4, H, W)
+        msk = msk.transpose(1, 2)[0]
+
+        image_embeds = {
+            "image_embeds": y,
+
+            #"max_seq_len": max_seq_len,
+            "num_frames": num_frames,
+            "lat_h": H,
+            "lat_w": W,
+            "mask": msk
+        }
+
+        return (image_embeds,)
+
 #region I2V encode
 class WanVideoImageToVideoEncode:
     @classmethod
@@ -2250,6 +2308,7 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoUniLumosEmbeds": WanVideoUniLumosEmbeds,
     "WanVideoAddTTMLatents": WanVideoAddTTMLatents,
     "WanVideoAddStoryMemLatents": WanVideoAddStoryMemLatents,
+    "WanVideoSVIProEmbeds": WanVideoSVIProEmbeds,
     }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -2291,4 +2350,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoUniLumosEmbeds": "WanVideo UniLumos Embeds",
     "WanVideoAddTTMLatents": "WanVideo Add TTMLatents",
     "WanVideoAddStoryMemLatents": "WanVideo Add StoryMem Latents",
+    "WanVideoSVIProEmbeds": "WanVideo SVIPro Embeds",
 }
