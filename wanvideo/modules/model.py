@@ -477,7 +477,6 @@ class WanSelfAttention(nn.Module):
         """
         attention_mode = self.attention_mode
         if attention_mode_override is not None:
-            print("Overriding attention mode to:", attention_mode_override)
             attention_mode = attention_mode_override
 
         if self.ref_adapter is not None and lynx_ref_feature is not None:
