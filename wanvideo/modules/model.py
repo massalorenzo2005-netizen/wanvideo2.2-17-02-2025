@@ -467,7 +467,7 @@ class WanSelfAttention(nn.Module):
         v = (self.v(x) + self.v_loras(x)).view(b, s, n, d)
         return q, k, v
 
-    def forward(self, q, k, v, seq_lens, lynx_ref_feature=None, lynx_ref_scale=1.0, attention_mode_override=None, onetoall_ref=None, onetoall_ref_scale=1.0):
+    def forward(self, q, k, v, seq_lens, lynx_ref_feature=None, lynx_ref_scale=1.0, attention_mode_override=None, onetoall_ref=None, onetoall_ref_scale=1.0, frame_tokens=1536):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -482,7 +482,7 @@ class WanSelfAttention(nn.Module):
         if self.ref_adapter is not None and lynx_ref_feature is not None:
             ref_x = self.ref_adapter(self, q, lynx_ref_feature)
 
-        x = attention(q, k, v, k_lens=seq_lens, attention_mode=attention_mode, heads=self.num_heads)
+        x = attention(q, k, v, k_lens=seq_lens, attention_mode=attention_mode, heads=self.num_heads, frame_tokens=frame_tokens)
 
         if self.ref_adapter is not None and lynx_ref_feature is not None:
             x = x.add(ref_x, alpha=lynx_ref_scale)
@@ -497,7 +497,7 @@ class WanSelfAttention(nn.Module):
         attention_mode = self.attention_mode
         if attention_mode_override is not None:
             attention_mode = attention_mode_override
-        
+
         # Concatenate main and IP keys/values for main attention
         full_k = torch.cat([k, k_ip], dim=1)
         full_v = torch.cat([v, v_ip], dim=1)
@@ -1006,6 +1006,7 @@ class WanAttentionBlock(nn.Module):
         longcat_num_cond_latents=0, longcat_avatar_options=None, #longcat image cond amount
         x_onetoall_ref=None, onetoall_freqs=None, onetoall_ref=None, onetoall_ref_scale=1.0, #one-to-all
         e_tr=None, tr_num=0, tr_start=0, #token replacement
+        attention_mode_override=None, frame_tokens=None,
     ):
         r"""
         Args:
@@ -1150,6 +1151,10 @@ class WanAttentionBlock(nn.Module):
         if enhance_enabled:
             feta_scores = get_feta_scores(q, k)
 
+        if self.attention_mode == "sageattn_3" and attention_mode_override is None:
+            if current_step != 0 and not last_step:
+                attention_mode_override = "sageattn"
+
         #self-attention
         split_attn = (context is not None
                       and (context.shape[0] > 1 or (clip_embed is not None and clip_embed.shape[0] > 1))
@@ -1161,19 +1166,14 @@ class WanAttentionBlock(nn.Module):
             y = self.self_attn.forward_split(q, k, v, seq_lens, grid_sizes, seq_chunks)
         elif ref_target_masks is not None: #multi/infinite talk
             y, x_ref_attn_map = self.self_attn.forward_multitalk(q, k, v, seq_lens, grid_sizes, ref_target_masks)
-        elif self.attention_mode == "radial_sage_attention":
+        elif self.attention_mode == "radial_sage_attention" or attention_mode_override is not None and attention_mode_override == "radial_sage_attention":
             if self.dense_block or self.dense_timesteps is not None and current_step < self.dense_timesteps:
                 if self.dense_attention_mode == "sparse_sage_attn":
                     y = self.self_attn.forward_radial(q, k, v, dense_step=True)
                 else:
-                    y = self.self_attn.forward(q, k, v, seq_lens)
+                    y = self.self_attn.forward(q, k, v, seq_lens, attention_mode_override=attention_mode_override)
             else:
                 y = self.self_attn.forward_radial(q, k, v, dense_step=False)
-        elif self.attention_mode == "sageattn_3":
-            if current_step != 0 and not last_step:
-                y = self.self_attn.forward(q, k, v, seq_lens, attention_mode_override="sageattn_3")
-            else:
-                y = self.self_attn.forward(q, k, v, seq_lens, attention_mode_override="sageattn")
         elif x_ip is not None and self.kv_cache is None: #stand-in
             # First pass: cache IP keys/values and compute attention
             self.kv_cache = {"k_ip": k_ip.detach(), "v_ip": v_ip.detach()}
@@ -1184,18 +1184,18 @@ class WanAttentionBlock(nn.Module):
             v_ip = self.kv_cache["v_ip"]
             full_k = torch.cat([k, k_ip], dim=1)
             full_v = torch.cat([v, v_ip], dim=1)
-            y = self.self_attn.forward(q, full_k, full_v, seq_lens)
+            y = self.self_attn.forward(q, full_k, full_v, seq_lens, attention_mode_override=attention_mode_override)
         elif is_longcat and longcat_num_cond_latents > 0:
             if longcat_num_cond_latents == 1:
                 num_cond_latents_thw = longcat_num_cond_latents * (N // num_latent_frames)
                 # process the noise tokens
-                x_noise = self.self_attn.forward(q[:, num_cond_latents_thw:].contiguous(), k, v, seq_lens)
+                x_noise = self.self_attn.forward(q[:, num_cond_latents_thw:].contiguous(), k, v, seq_lens, attention_mode_override=attention_mode_override)
                 # process the condition tokens
                 x_cond = self.self_attn.forward(
                     q[:, :num_cond_latents_thw].contiguous(),
                     k[:, :num_cond_latents_thw].contiguous(),
                     v[:, :num_cond_latents_thw].contiguous(),
-                    seq_lens)
+                    seq_lens, attention_mode_override=attention_mode_override)
                 # merge x_cond and x_noise
                 y = torch.cat([x_cond, x_noise], dim=1).contiguous()
             elif longcat_num_cond_latents > 1: # video continuation
@@ -1237,13 +1237,14 @@ class WanAttentionBlock(nn.Module):
                 q_cond = q[:, num_ref_latents_thw:num_cond_latents_thw].contiguous()
                 k_cond = k[:, num_ref_latents_thw:num_cond_latents_thw].contiguous()
                 v_cond = v[:, num_ref_latents_thw:num_cond_latents_thw].contiguous()
-                x_ref = self.self_attn.forward(q_ref, k_ref, v_ref, seq_lens)
-                x_cond = self.self_attn.forward(q_cond, k_cond, v_cond, seq_lens)
+                x_ref = self.self_attn.forward(q_ref, k_ref, v_ref, seq_lens, attention_mode_override=attention_mode_override)
+                x_cond = self.self_attn.forward(q_cond, k_cond, v_cond, seq_lens, attention_mode_override=attention_mode_override)
 
                 # merge x_cond and x_noise
                 y = torch.cat([x_ref, x_cond, x_noise], dim=1).contiguous()
         else:
-            y = self.self_attn.forward(q, k, v, seq_lens, lynx_ref_feature=lynx_ref_feature, lynx_ref_scale=lynx_ref_scale, onetoall_ref=onetoall_ref, onetoall_ref_scale=onetoall_ref_scale)
+            y = self.self_attn.forward(q, k, v, seq_lens, lynx_ref_feature=lynx_ref_feature, lynx_ref_scale=lynx_ref_scale,
+                                       onetoall_ref=onetoall_ref, onetoall_ref_scale=onetoall_ref_scale, attention_mode_override=attention_mode_override, frame_tokens=frame_tokens)
 
         del q, k, v
 
@@ -2187,7 +2188,7 @@ class WanModel(torch.nn.Module):
 
     def rope_encode_comfy(self, t, h, w, freq_offset=0, t_start=0, ref_frame_shape=None, pose_frame_shape=None,
                           steps_t=None, steps_h=None, steps_w=None, ntk_alphas=[1,1,1], device=None, dtype=None,
-                          ref_frame_index=10, longcat_num_ref_latents=None):
+                          ref_frame_index=10, longcat_num_ref_latents=0):
 
         patch_size = self.patch_size
         t_len = ((t + (patch_size[0] // 2)) // patch_size[0])
@@ -2280,6 +2281,7 @@ class WanModel(torch.nn.Module):
         self, x, t, context, seq_len,
         is_uncond=False,
         current_step_percentage=0.0, current_step=0, last_step=0, total_steps=50,
+        attention_mode_override=None,
         clip_fea=None, y=None,
         device=torch.device('cuda'),
         freqs=None,
@@ -2664,7 +2666,7 @@ class WanModel(torch.nn.Module):
                     device=x.device,
                     dtype=x.dtype
                 )
-                log.info("Generated new RoPE frequencies")
+                tqdm.write("Generated new RoPE frequencies")
 
                 if s2v_ref_latent is not None:
                     freqs_ref = self.rope_encode_comfy(
@@ -3093,6 +3095,7 @@ class WanModel(torch.nn.Module):
                 camera_embed=camera_embed,
                 audio_proj=audio_proj,
                 num_latent_frames = F,
+                frame_tokens=x.shape[1] // F,
                 original_seq_len=self.original_seq_len,
                 enhance_enabled=enhance_enabled,
                 audio_scale=audio_scale,
@@ -3179,8 +3182,21 @@ class WanModel(torch.nn.Module):
             if lynx_ref_buffer is None and lynx_ref_feature_extractor:
                 lynx_ref_buffer = {}
 
+            attn_override_blocks = attention_mode = None
+            attention_mode_override_active = False
+            if attention_mode_override is not None:
+                attn_override_blocks = attention_mode_override.get("blocks", range(len(self.blocks)))
+                if attention_mode_override["start_step"] <= current_step < attention_mode_override["end_step"]:
+                    attention_mode_override_active = True
+                    if attention_mode_override["verbose"]:
+                        tqdm.write(f"Applying attention mode override: {attention_mode_override['mode']} at step {current_step} on blocks: {attn_override_blocks if attn_override_blocks is not None else 'all'}")
+
             for b, block in enumerate(self.blocks):
                 mm.throw_exception_if_processing_interrupted()
+                if attention_mode_override_active and b in attn_override_blocks:
+                    attention_mode = attention_mode_override['mode']
+                else:
+                    attention_mode = None
                 block_idx = f"{b:02d}"
                 if lynx_ref_buffer is not None and not lynx_ref_feature_extractor:
                     lynx_ref_feature = lynx_ref_buffer.get(block_idx, None)
@@ -3224,7 +3240,7 @@ class WanModel(torch.nn.Module):
                     x_onetoall_ref = onetoall_ref_block_samples[b // interval_ref]
 
                 # ---run block----#
-                x, x_ip, lynx_ref_feature, x_ovi = block(x, x_ip=x_ip, lynx_ref_feature=lynx_ref_feature, x_ovi=x_ovi, x_onetoall_ref=x_onetoall_ref, onetoall_freqs=onetoall_freqs, **kwargs)
+                x, x_ip, lynx_ref_feature, x_ovi = block(x, x_ip=x_ip, lynx_ref_feature=lynx_ref_feature, x_ovi=x_ovi, x_onetoall_ref=x_onetoall_ref, onetoall_freqs=onetoall_freqs, attention_mode_override=attention_mode, **kwargs)
                 # ---post block----#
 
                 # dual controlnet

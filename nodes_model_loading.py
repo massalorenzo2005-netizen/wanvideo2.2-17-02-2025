@@ -36,6 +36,9 @@ try:
 except:
     PromptServer = None
 
+attention_modes = ["sdpa", "flash_attn_2", "flash_attn_3", "sageattn", "sageattn_3", "radial_sage_attention", "sageattn_compiled",
+                    "sageattn_ultravico", "comfy"]
+
 #from city96's gguf nodes
 def update_folder_names_and_paths(key, targets=[]):
     # check for existing key
@@ -178,7 +181,7 @@ def standardize_lora_key_format(lora_sd):
 
                         new_key += f".{component}"
 
-                # Handle weight type - this is the critical fix
+                # Handle weight type
                 if weight_type:
                     if weight_type == 'alpha':
                         new_key += '.alpha'
@@ -209,12 +212,12 @@ def standardize_lora_key_format(lora_sd):
                 new_key = new_key.replace('time_embedding', 'time.embedding')
                 new_key = new_key.replace('time_projection', 'time.projection')
 
-                # Replace remaining underscores with dots, carefully
+                # Replace remaining underscores with dots
                 parts = new_key.split('.')
                 final_parts = []
                 for part in parts:
                     if part in ['img_emb', 'self_attn', 'cross_attn']:
-                        final_parts.append(part)  # Keep these intact
+                        final_parts.append(part)
                     else:
                         final_parts.append(part.replace('_', '.'))
                 new_key = '.'.join(final_parts)
@@ -272,6 +275,20 @@ def standardize_lora_key_format(lora_sd):
         if "txt_attn.qkv" in k:
             k = k.replace("txt_attn.qkv", "txt_attn_qkv")
         new_sd[k] = v
+    return new_sd
+
+def compensate_rs_lora_format(lora_sd):
+    rank = lora_sd["base_model.model.blocks.0.cross_attn.k.lora_A.weight"].shape[0]
+    alpha = torch.tensor(rank * rank // rank ** 0.5)
+    log.info(f"Detected rank stabilized peft lora format with rank {rank}, setting alpha to {alpha} to compensate.")
+    new_sd = {}
+    for k, v in lora_sd.items():
+        if k.endswith(".lora_A.weight"):
+            new_sd[k] = v
+            new_k = k.replace(".lora_A.weight", ".alpha")
+            new_sd[new_k] = alpha
+        else:
+            new_sd[k] = v
     return new_sd
 
 class WanVideoBlockSwap:
@@ -364,7 +381,7 @@ class WanVideoLoraSelect:
             "required": {
                "lora": (folder_paths.get_filename_list("loras"),
                 {"tooltip": "LORA models are expected to be in ComfyUI/models/loras with .safetensors extension"}),
-                "strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.0001, "tooltip": "LORA strength, set to 0.0 to unmerge the LORA"}),
+                "strength": ("FLOAT", {"default": 1.0, "min": -1000.0, "max": 1000.0, "step": 0.0001, "tooltip": "LORA strength, set to 0.0 to unmerge the LORA"}),
             },
             "optional": {
                 "prev_lora":("WANVIDLORA", {"default": None, "tooltip": "For loading multiple LoRAs"}),
@@ -756,6 +773,8 @@ class WanVideoSetLoRAs:
             lora_sd = load_torch_file(lora_path, safe_load=True)
             if "dwpose_embedding.0.weight" in lora_sd: #unianimate
                 raise NotImplementedError("Unianimate LoRA patching is not implemented in this node.")
+            if "base_model.model.blocks.0.cross_attn.k.lora_A.weight" in lora_sd: # assume rs_lora
+                lora_sd = compensate_rs_lora_format(lora_sd)
 
             lora_sd = standardize_lora_key_format(lora_sd)
             if l["blocks"]:
@@ -967,7 +986,8 @@ def add_lora_weights(patcher, lora, base_dtype, merge_loras=False):
             from .unianimate.nodes import update_transformer
             log.info("Unianimate LoRA detected, patching model...")
             patcher.model.diffusion_model, unianimate_sd = update_transformer(patcher.model.diffusion_model, lora_sd)
-
+        if "base_model.model.blocks.0.cross_attn.k.lora_A.weight" in lora_sd: # assume rs_lora
+                lora_sd = compensate_rs_lora_format(lora_sd)
         lora_sd = standardize_lora_key_format(lora_sd)
 
         if l["blocks"]:
@@ -989,6 +1009,43 @@ def add_lora_weights(patcher, lora, base_dtype, merge_loras=False):
         del lora_sd
     return patcher, control_lora, unianimate_sd
 
+class WanVideoSetAttentionModeOverride:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("WANVIDEOMODEL", ),
+                "attention_mode": (attention_modes, {"default": "sdpa"}),
+                "start_step": ("INT", {"default": 0, "min": 0, "max": 10000, "step": 1, "tooltip": "Step to start applying the attention mode override"}),
+                "end_step": ("INT", {"default": 10000, "min": 1, "max": 10000, "step": 1, "tooltip": "Step to end applying the attention mode override"}),
+                "verbose": ("BOOLEAN", {"default": False, "tooltip": "Print verbose info about attention mode override during generation"}),
+            },
+            "optional": {
+                "blocks":("INT", {"forceInput": True} ),
+            }
+        }
+
+    RETURN_TYPES = ("WANVIDEOMODEL",)
+    RETURN_NAMES = ("model", )
+    FUNCTION = "getmodelpath"
+    CATEGORY = "WanVideoWrapper"
+    DESCRIPTION = "Override the attention mode for the model for specific step and/or block range"
+
+    def getmodelpath(self, model, attention_mode, start_step, end_step, verbose, blocks=None):
+        model_clone = model.clone()
+        attention_mode_override = {
+            "mode": attention_mode,
+            "start_step": start_step,
+            "end_step": end_step,
+            "verbose": verbose,
+        }
+        if blocks is not None:
+            attention_mode_override["blocks"] = blocks
+        model_clone.model_options['transformer_options']["attention_mode_override"] = attention_mode_override
+
+        return (model_clone,)
+
+
 #region Model loading
 class WanVideoModelLoader:
     @classmethod
@@ -1003,17 +1060,7 @@ class WanVideoModelLoader:
             "load_device": (["main_device", "offload_device"], {"default": "offload_device", "tooltip": "Initial device to load the model to, NOT recommended with the larger models unless you have 48GB+ VRAM"}),
             },
             "optional": {
-                "attention_mode": ([
-                    "sdpa",
-                    "flash_attn_2",
-                    "flash_attn_3",
-                    "sageattn",
-                    "sageattn_3",
-                    "radial_sage_attention",
-                    "sageattn_compiled",
-                    "sageattn_ultravico",
-                    "comfy"
-                    ], {"default": "sdpa"}),
+                "attention_mode": (attention_modes, {"default": "sdpa"}),
                 "compile_args": ("WANCOMPILEARGS", ),
                 "block_swap_args": ("BLOCKSWAPARGS", ),
                 "lora": ("WANVIDLORA", {"default": None}),
@@ -1218,9 +1265,7 @@ class WanVideoModelLoader:
             lynx_ip_layers = "lite"
 
         model_type = "t2v"
-        if "audio_injector.injector.0.k.weight" in sd:
-            model_type = "s2v"
-        elif not "text_embedding.0.weight" in sd:
+        if not "text_embedding.0.weight" in sd:
             model_type = "no_cross_attn" #minimaxremover
         elif "model_type.Wan2_1-FLF2V-14B-720P" in sd or "img_emb.emb_pos" in sd or "flf2v" in model.lower():
             model_type = "fl2v"
@@ -1230,6 +1275,8 @@ class WanVideoModelLoader:
             model_type = "t2v"
         elif "control_adapter.conv.weight" in sd:
             model_type = "t2v"
+        if "audio_injector.injector.0.k.weight" in sd:
+            model_type = "s2v"
 
         out_dim = 16
         if dim == 5120: #14B
@@ -2044,6 +2091,7 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoTorchCompileSettings": WanVideoTorchCompileSettings,
     "LoadWanVideoT5TextEncoder": LoadWanVideoT5TextEncoder,
     "LoadWanVideoClipTextEncoder": LoadWanVideoClipTextEncoder,
+    "WanVideoSetAttentionModeOverride": WanVideoSetAttentionModeOverride,
     }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -2062,4 +2110,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoTorchCompileSettings": "WanVideo Torch Compile Settings",
     "LoadWanVideoT5TextEncoder": "WanVideo T5 Text Encoder Loader",
     "LoadWanVideoClipTextEncoder": "WanVideo CLIP Text Encoder Loader",
+    "WanVideoSetAttentionModeOverride": "WanVideo Set Attention Mode Override",
     }
