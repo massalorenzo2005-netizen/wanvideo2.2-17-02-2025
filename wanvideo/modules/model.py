@@ -467,7 +467,7 @@ class WanSelfAttention(nn.Module):
         v = (self.v(x) + self.v_loras(x)).view(b, s, n, d)
         return q, k, v
 
-    def forward(self, q, k, v, seq_lens, lynx_ref_feature=None, lynx_ref_scale=1.0, attention_mode_override=None, onetoall_ref=None, onetoall_ref_scale=1.0, frame_tokens=1536):
+    def forward(self, q, k, v, seq_lens, transformer_options={}, attention_mode_override=None, lynx_ref_feature=None, lynx_ref_scale=1.0, onetoall_ref=None, onetoall_ref_scale=1.0, frame_tokens=1536):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -482,7 +482,7 @@ class WanSelfAttention(nn.Module):
         if self.ref_adapter is not None and lynx_ref_feature is not None:
             ref_x = self.ref_adapter(self, q, lynx_ref_feature)
 
-        x = attention(q, k, v, k_lens=seq_lens, attention_mode=attention_mode, heads=self.num_heads, frame_tokens=frame_tokens)
+        x = attention(q, k, v, k_lens=seq_lens, attention_mode=attention_mode, heads=self.num_heads, frame_tokens=frame_tokens, transformer_options=transformer_options)
 
         if self.ref_adapter is not None and lynx_ref_feature is not None:
             x = x.add(ref_x, alpha=lynx_ref_scale)
@@ -1006,7 +1006,7 @@ class WanAttentionBlock(nn.Module):
         longcat_num_cond_latents=0, longcat_avatar_options=None, #longcat image cond amount
         x_onetoall_ref=None, onetoall_freqs=None, onetoall_ref=None, onetoall_ref_scale=1.0, #one-to-all
         e_tr=None, tr_num=0, tr_start=0, #token replacement
-        attention_mode_override=None, frame_tokens=None,
+        attention_mode_override=None, frame_tokens=None, transformer_options={}
     ):
         r"""
         Args:
@@ -1189,13 +1189,13 @@ class WanAttentionBlock(nn.Module):
             if longcat_num_cond_latents == 1:
                 num_cond_latents_thw = longcat_num_cond_latents * (N // num_latent_frames)
                 # process the noise tokens
-                x_noise = self.self_attn.forward(q[:, num_cond_latents_thw:].contiguous(), k, v, seq_lens, attention_mode_override=attention_mode_override)
+                x_noise = self.self_attn.forward(q[:, num_cond_latents_thw:].contiguous(), k, v, seq_lens, attention_mode_override=attention_mode_override, transformer_options=transformer_options)
                 # process the condition tokens
                 x_cond = self.self_attn.forward(
                     q[:, :num_cond_latents_thw].contiguous(),
                     k[:, :num_cond_latents_thw].contiguous(),
                     v[:, :num_cond_latents_thw].contiguous(),
-                    seq_lens, attention_mode_override=attention_mode_override)
+                    seq_lens, attention_mode_override=attention_mode_override, transformer_options=transformer_options)
                 # merge x_cond and x_noise
                 y = torch.cat([x_cond, x_noise], dim=1).contiguous()
             elif longcat_num_cond_latents > 1: # video continuation
@@ -1224,12 +1224,12 @@ class WanAttentionBlock(nn.Module):
                         k_non_ref = k[:, num_ref_latents_thw:].contiguous()
                         v_non_ref = v[:, num_ref_latents_thw:].contiguous()
 
-                        x_noise_front = self.self_attn.forward(q_noise_front, k, v, seq_lens) # q_front has attention with ref + cond + noisy
-                        x_noise_back = self.self_attn.forward(q_noise_back, k, v, seq_lens) # q_back has attention with ref + cond + noisy
-                        x_noise_maskref = self.self_attn.forward(q_noise_maskref, k_non_ref, v_non_ref, seq_lens) # q_mask has attention with cond+noisy
+                        x_noise_front = self.self_attn.forward(q_noise_front, k, v, seq_lens, attention_mode_override=attention_mode_override, transformer_options=transformer_options) # q_front has attention with ref + cond + noisy
+                        x_noise_back = self.self_attn.forward(q_noise_back, k, v, seq_lens, attention_mode_override=attention_mode_override, transformer_options=transformer_options) # q_back has attention with ref + cond + noisy
+                        x_noise_maskref = self.self_attn.forward(q_noise_maskref, k_non_ref, v_non_ref, seq_lens, attention_mode_override=attention_mode_override, transformer_options=transformer_options) # q_mask has attention with cond+noisy
                         x_noise = torch.cat([x_noise_front, x_noise_maskref, x_noise_back], dim=1).contiguous()
                     else:
-                        x_noise = self.self_attn.forward(q_noise, k, v, seq_lens)
+                        x_noise = self.self_attn.forward(q_noise, k, v, seq_lens, attention_mode_override=attention_mode_override, transformer_options=transformer_options)
                 # process the condition tokens
                 q_ref = q[:, :num_ref_latents_thw].contiguous()
                 k_ref = k[:, :num_ref_latents_thw].contiguous()
@@ -1237,14 +1237,14 @@ class WanAttentionBlock(nn.Module):
                 q_cond = q[:, num_ref_latents_thw:num_cond_latents_thw].contiguous()
                 k_cond = k[:, num_ref_latents_thw:num_cond_latents_thw].contiguous()
                 v_cond = v[:, num_ref_latents_thw:num_cond_latents_thw].contiguous()
-                x_ref = self.self_attn.forward(q_ref, k_ref, v_ref, seq_lens, attention_mode_override=attention_mode_override)
-                x_cond = self.self_attn.forward(q_cond, k_cond, v_cond, seq_lens, attention_mode_override=attention_mode_override)
+                x_ref = self.self_attn.forward(q_ref, k_ref, v_ref, seq_lens, attention_mode_override=attention_mode_override, transformer_options=transformer_options)
+                x_cond = self.self_attn.forward(q_cond, k_cond, v_cond, seq_lens, attention_mode_override=attention_mode_override, transformer_options=transformer_options)
 
                 # merge x_cond and x_noise
                 y = torch.cat([x_ref, x_cond, x_noise], dim=1).contiguous()
         else:
             y = self.self_attn.forward(q, k, v, seq_lens, lynx_ref_feature=lynx_ref_feature, lynx_ref_scale=lynx_ref_scale,
-                                       onetoall_ref=onetoall_ref, onetoall_ref_scale=onetoall_ref_scale, attention_mode_override=attention_mode_override, frame_tokens=frame_tokens)
+                                       onetoall_ref=onetoall_ref, onetoall_ref_scale=onetoall_ref_scale, attention_mode_override=attention_mode_override, transformer_options=transformer_options, frame_tokens=frame_tokens)
 
         del q, k, v
 
@@ -2281,7 +2281,6 @@ class WanModel(torch.nn.Module):
         self, x, t, context, seq_len,
         is_uncond=False,
         current_step_percentage=0.0, current_step=0, last_step=0, total_steps=50,
-        attention_mode_override=None,
         clip_fea=None, y=None,
         device=torch.device('cuda'),
         freqs=None,
@@ -2320,6 +2319,7 @@ class WanModel(torch.nn.Module):
         sdancer_input=None,  # SteadyDancer
         one_to_all_input=None, one_to_all_controlnet_strength=0.0, # One-to-All
         scail_input=None,  # SCAIL pose
+        transformer_options={},
     ):
         r"""
         Forward pass through the diffusion model
@@ -3069,6 +3069,7 @@ class WanModel(torch.nn.Module):
                 e_tr=e0_token_replace if use_token_replace else None,
                 tr_start=token_replace_start,
                 tr_num=replace_token_num,
+                transformer_options=transformer_options
             )
             if self.audio_model is not None:
                 kwargs['e_ovi'] = e0_ovi.to(self.base_dtype)
@@ -3130,6 +3131,7 @@ class WanModel(torch.nn.Module):
 
             attn_override_blocks = attention_mode = None
             attention_mode_override_active = False
+            attention_mode_override = transformer_options.get("attention_mode_override", None)
             if attention_mode_override is not None:
                 attn_override_blocks = attention_mode_override.get("blocks", range(len(self.blocks)))
                 if attention_mode_override["start_step"] <= current_step < attention_mode_override["end_step"]:

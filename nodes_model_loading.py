@@ -1046,6 +1046,29 @@ class WanVideoSetAttentionModeOverride:
         return (model_clone,)
 
 
+class WanVideoUltraVicoSettings:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("WANVIDEOMODEL", ),
+                "alpha": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.001}),
+            },
+        }
+
+    RETURN_TYPES = ("WANVIDEOMODEL",)
+    RETURN_NAMES = ("model", )
+    FUNCTION = "getmodelpath"
+    CATEGORY = "WanVideoWrapper"
+    DESCRIPTION = "Override the attention mode for the model for specific step and/or block range"
+
+    def getmodelpath(self, model, alpha):
+        model_clone = model.clone()
+        model_clone.model_options['transformer_options']["ultravico_alpha"] = alpha
+
+        return (model_clone,)
+
+
 #region Model loading
 class WanVideoModelLoader:
     @classmethod
@@ -2074,6 +2097,7 @@ NODE_CLASS_MAPPINGS = {
     "LoadWanVideoT5TextEncoder": LoadWanVideoT5TextEncoder,
     "LoadWanVideoClipTextEncoder": LoadWanVideoClipTextEncoder,
     "WanVideoSetAttentionModeOverride": WanVideoSetAttentionModeOverride,
+    "WanVideoUltraVicoSettings": WanVideoUltraVicoSettings,
     }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -2093,4 +2117,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LoadWanVideoT5TextEncoder": "WanVideo T5 Text Encoder Loader",
     "LoadWanVideoClipTextEncoder": "WanVideo CLIP Text Encoder Loader",
     "WanVideoSetAttentionModeOverride": "WanVideo Set Attention Mode Override",
+    "WanVideoUltraVicoSettings": "WanVideo UltraVico Settings"
     }

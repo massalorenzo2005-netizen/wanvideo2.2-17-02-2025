@@ -96,7 +96,7 @@ class WanVideoSampler:
         vae = image_embeds.get("vae", None)
         tiled_vae = image_embeds.get("tiled_vae", False)
 
-        transformer_options = patcher.model_options.get("transformer_options", None)
+        transformer_options = copy.deepcopy(patcher.model_options.get("transformer_options", None))
         merge_loras = transformer_options["merge_loras"]
 
         block_swap_args = transformer_options.get("block_swap_args", None)
@@ -1414,7 +1414,6 @@ class WanVideoSampler:
                     'is_uncond': False, # is unconditional
                     'current_step': idx, # current step
                     'current_step_percentage': current_step_percentage, # current step percentage
-                    'attention_mode_override': transformer_options.get("attention_mode_override", None),
                     'last_step': len(timesteps) - 1 == idx, # is last step
                     'control_lora_enabled': control_lora_enabled, # control lora toggle for patch embed selection
                     'enhance_enabled': enhance_enabled, # enhance-a-video toggle
@@ -1466,6 +1465,7 @@ class WanVideoSampler:
                     "one_to_all_input": one_to_all_data, # One-to-All input
                     "one_to_all_controlnet_strength": one_to_all_data["controlnet_strength"] if one_to_all_data is not None else 0.0,
                     "scail_input": scail_data_in, # SCAIL input
+                    "transformer_options": transformer_options
                 }
 
                 batch_size = 1
