@@ -177,7 +177,6 @@ class WanVideoSampler:
             start_step = scheduler.get("start_step", start_step)
         elif scheduler != "multitalk":
             sample_scheduler, timesteps,_,_ = get_scheduler(scheduler, steps, start_step, end_step, shift, device, transformer.dim, denoise_strength, sigmas=sigmas, log_timesteps=True)
-            log.info(f"sigmas: {sample_scheduler.sigmas}")
         else:
             timesteps = torch.tensor([1000, 750, 500, 250], device=device)
 
@@ -240,8 +239,6 @@ class WanVideoSampler:
                 image_cond = torch.cat([image_cond_mask, image_cond])
             else:
                 image_cond[:, 1:] = 0
-
-            log.info(f"image_cond shape: {image_cond.shape}")
 
             #ATI tracks
             if transformer_options is not None:
@@ -1679,8 +1676,8 @@ class WanVideoSampler:
         callback = prepare_callback(patcher, len(timesteps))
 
         if not multitalk_sampling and not framepack and not wananimate_loop:
-            log.info(f"Input sequence length: {seq_len}")
-            log.info(f"Sampling {(latent_video_length-1) * 4 + 1} frames at {latent.shape[3]*vae_upscale_factor}x{latent.shape[2]*vae_upscale_factor} with {steps-ttm_start_step} steps")
+            log.info("-" * 10 + " Sampling start " + "-" * 10)
+            log.info(f"{(latent_video_length-1) * 4 + 1} frames at {latent.shape[3]*vae_upscale_factor}x{latent.shape[2]*vae_upscale_factor} (Input sequence length: {seq_len}) with {steps-ttm_start_step} steps")
 
 
         # Differential diffusion prep
@@ -2572,6 +2569,8 @@ class WanVideoSampler:
             latent = latent[:, longcat_ref_latent.shape[1]:]
         if story_mem_latents is not None:
             latent = latent[:, story_mem_latents.shape[1]:]
+
+        log.info("-" * 10 + " Sampling end " + "-" * 12)
 
         cache_states = None
         if cache_args is not None:

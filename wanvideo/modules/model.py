@@ -2019,24 +2019,24 @@ class WanModel(torch.nn.Module):
     def block_swap(self, blocks_to_swap, offload_txt_emb=False, offload_img_emb=False, vace_blocks_to_swap=None, prefetch_blocks=0, block_swap_debug=False):
         # Clamp blocks_to_swap to valid range
         blocks_to_swap = max(0, min(blocks_to_swap, len(self.blocks)))
-        
+
         log.info(f"Swapping {blocks_to_swap} transformer blocks")
         self.blocks_to_swap = blocks_to_swap
         self.prefetch_blocks = prefetch_blocks
         self.block_swap_debug = block_swap_debug
-        
+
         self.offload_img_emb = offload_img_emb
         self.offload_txt_emb = offload_txt_emb
 
         total_offload_memory = 0
         total_main_memory = 0
-        
+
         # Calculate the index where swapping starts
         swap_start_idx = len(self.blocks) - blocks_to_swap
-       
+
         for b, block in tqdm(enumerate(self.blocks), total=len(self.blocks), desc="Initializing block swap"):
             block_memory = get_module_memory_mb(block)
-            
+
             if b < swap_start_idx:
                 block.to(self.main_device)
                 total_main_memory += block_memory
@@ -2051,13 +2051,13 @@ class WanModel(torch.nn.Module):
             # Clamp vace_blocks_to_swap to valid range
             vace_blocks_to_swap = max(0, min(vace_blocks_to_swap, len(self.vace_blocks)))
             self.vace_blocks_to_swap = vace_blocks_to_swap
-            
+
             # Calculate the index where VACE swapping starts
             vace_swap_start_idx = len(self.vace_blocks) - vace_blocks_to_swap
 
             for b, block in tqdm(enumerate(self.vace_blocks), total=len(self.vace_blocks), desc="Initializing vace block swap"):
                 block_memory = get_module_memory_mb(block)
-                
+
                 if b < vace_swap_start_idx:
                     block.to(self.main_device)
                     total_main_memory += block_memory
@@ -2068,13 +2068,13 @@ class WanModel(torch.nn.Module):
         mm.soft_empty_cache()
         gc.collect()
 
-        log.info("----------------------")
-        log.info(f"Block swap memory summary:")
+        log.info("-" * 25)
+        log.info("Block swap memory summary:")
         log.info(f"Transformer blocks on {self.offload_device}: {total_offload_memory:.2f}MB")
         log.info(f"Transformer blocks on {self.main_device}: {total_main_memory:.2f}MB")
         log.info(f"Total memory used by transformer blocks: {(total_offload_memory + total_main_memory):.2f}MB")
         log.info(f"Non-blocking memory transfer: {self.use_non_blocking}")
-        log.info("----------------------")
+        log.info("-" * 25)
 
     def forward_vace(
         self,

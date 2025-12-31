@@ -1,11 +1,11 @@
 try:
-    from .utils import check_duplicate_nodes, log
+    from .utils import check_duplicate_nodes, log, color_text
     duplicate_dirs = check_duplicate_nodes()
     if duplicate_dirs:
         warning_msg = f"WARNING:  Found {len(duplicate_dirs)} other WanVideoWrapper directories:\n"
         for dir_path in duplicate_dirs:
-            warning_msg += f"  - {dir_path}\n"
-        log.warning(warning_msg + "Please remove duplicates to avoid possible conflicts.")
+            warning_msg += f"  - {color_text(dir_path, 'yellow')}\n"
+        log.warning(color_text(warning_msg + "Please remove duplicates to avoid possible conflicts.", "red"))
 except:
     pass
 
