@@ -72,3 +72,6 @@ for module_path, name in OPTIONAL_MODULES:
     register_nodes(module_path, name, optional=True)
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
+
+# Add AMD GPU compatibility support
+from . import amd_fix
