@@ -96,7 +96,7 @@ class WanVideoSampler:
         vae = image_embeds.get("vae", None)
         tiled_vae = image_embeds.get("tiled_vae", False)
 
-        transformer_options = patcher.model_options.get("transformer_options", None)
+        transformer_options = copy.deepcopy(patcher.model_options.get("transformer_options", None))
         merge_loras = transformer_options["merge_loras"]
 
         block_swap_args = transformer_options.get("block_swap_args", None)
@@ -177,7 +177,6 @@ class WanVideoSampler:
             start_step = scheduler.get("start_step", start_step)
         elif scheduler != "multitalk":
             sample_scheduler, timesteps,_,_ = get_scheduler(scheduler, steps, start_step, end_step, shift, device, transformer.dim, denoise_strength, sigmas=sigmas, log_timesteps=True)
-            log.info(f"sigmas: {sample_scheduler.sigmas}")
         else:
             timesteps = torch.tensor([1000, 750, 500, 250], device=device)
 
@@ -240,8 +239,6 @@ class WanVideoSampler:
                 image_cond = torch.cat([image_cond_mask, image_cond])
             else:
                 image_cond[:, 1:] = 0
-
-            log.info(f"image_cond shape: {image_cond.shape}")
 
             #ATI tracks
             if transformer_options is not None:
@@ -1439,7 +1436,6 @@ class WanVideoSampler:
                     'is_uncond': False, # is unconditional
                     'current_step': idx, # current step
                     'current_step_percentage': current_step_percentage, # current step percentage
-                    'attention_mode_override': transformer_options.get("attention_mode_override", None),
                     'last_step': len(timesteps) - 1 == idx, # is last step
                     'control_lora_enabled': control_lora_enabled, # control lora toggle for patch embed selection
                     'enhance_enabled': enhance_enabled, # enhance-a-video toggle
@@ -1492,6 +1488,7 @@ class WanVideoSampler:
                     "one_to_all_controlnet_strength": one_to_all_data["controlnet_strength"] if one_to_all_data is not None else 0.0,
                     "scail_input": scail_data_in, # SCAIL input
                     "dual_control_input": dual_control_in, # LongVie2 dual control input
+                    "transformer_options": transformer_options
                 }
 
                 batch_size = 1
@@ -1705,8 +1702,8 @@ class WanVideoSampler:
         callback = prepare_callback(patcher, len(timesteps))
 
         if not multitalk_sampling and not framepack and not wananimate_loop:
-            log.info(f"Input sequence length: {seq_len}")
-            log.info(f"Sampling {(latent_video_length-1) * 4 + 1} frames at {latent.shape[3]*vae_upscale_factor}x{latent.shape[2]*vae_upscale_factor} with {steps-ttm_start_step} steps")
+            log.info("-" * 10 + " Sampling start " + "-" * 10)
+            log.info(f"{(latent_video_length-1) * 4 + 1} frames at {latent.shape[3]*vae_upscale_factor}x{latent.shape[2]*vae_upscale_factor} (Input sequence length: {seq_len}) with {steps-ttm_start_step} steps")
 
 
         # Differential diffusion prep
@@ -2598,6 +2595,8 @@ class WanVideoSampler:
             latent = latent[:, longcat_ref_latent.shape[1]:]
         if story_mem_latents is not None:
             latent = latent[:, story_mem_latents.shape[1]:]
+
+        log.info("-" * 10 + " Sampling end " + "-" * 12)
 
         cache_states = None
         if cache_args is not None:

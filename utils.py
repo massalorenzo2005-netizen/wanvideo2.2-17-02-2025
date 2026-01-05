@@ -25,6 +25,23 @@ try:
 except:
     pass
 
+COLOR_CODES = {
+    "reset": "\033[0m",
+    "red": "\033[31m",
+    "green": "\033[32m",
+    "yellow": "\033[33m",
+    "blue": "\033[34m",
+    "magenta": "\033[35m",
+    "cyan": "\033[36m",
+    "white": "\033[37m",
+}
+
+def color_text(text, color):
+    try:
+        return f"{COLOR_CODES.get(color, COLOR_CODES['reset'])}{text}{COLOR_CODES['reset']}"
+    except Exception:
+        return text
+
 class MetaParameter(torch.nn.Parameter):
     def __new__(cls, dtype, quant_type=None):
         data = torch.empty(0, dtype=dtype)
@@ -191,10 +208,8 @@ def check_diffusers_version():
         raise AssertionError("diffusers is not installed.")
 
 def print_memory(device, process="Sampling"):
-    memory = torch.cuda.memory_allocated(device) / 1024**3
     max_memory = torch.cuda.max_memory_allocated(device) / 1024**3
     max_reserved = torch.cuda.max_memory_reserved(device) / 1024**3
-    log.info(f"[{process}] Allocated memory: {memory=:.3f} GB")
     log.info(f"[{process}] Max allocated memory: {max_memory=:.3f} GB")
     log.info(f"[{process}] Max reserved memory: {max_reserved=:.3f} GB")
     #memory_summary = torch.cuda.memory_summary(device=device, abbreviated=False)
@@ -206,6 +221,18 @@ def get_module_memory_mb(module):
         if param.data is not None:
             memory += param.nelement() * param.element_size()
     return memory / (1024 * 1024)  # Convert to MB
+
+def get_module_memory_mb_per_device(module):
+    memory_per_device = {}
+    memory = 0
+    for param in module.parameters():
+        if param.data is not None:
+            device = str(param.device)
+            memory += param.nelement() * param.element_size()
+            memory_per_device[device] = memory_per_device.get(device, 0) + memory
+
+    memory_per_device = {dev: mem / (1024 * 1024) for dev, mem in memory_per_device.items()}
+    return memory_per_device
 
 def get_tensor_memory(tensor):
     memory_bytes = tensor.element_size() * tensor.nelement()
@@ -666,9 +693,9 @@ def check_duplicate_nodes():
     """Check ComfyUI custom_nodes directory for duplicate installations"""
     custom_nodes_dir = Path(folder_paths.folder_names_and_paths["custom_nodes"][0][0])
     current_path = Path(__file__).parent
-    
+
     wanvideo_dirs = []
-    
+
     # Check all directories in custom_nodes
     for path in custom_nodes_dir.iterdir():
         if (path.is_dir() and 
@@ -676,7 +703,7 @@ def check_duplicate_nodes():
             'wanvideo' in path.name.lower() and
             'wrapper' in path.name.lower()):
             wanvideo_dirs.append(str(path))
-    
+
     return wanvideo_dirs
 
 #https://github.com/temporalscorerescaling/TSR/

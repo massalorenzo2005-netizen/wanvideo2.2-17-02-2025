@@ -16,7 +16,7 @@ import copy
 
 VAE_STRIDE = (4, 8, 8)
 PATCH_SIZE = (1, 2, 2)
-vae_upscale_factor = 16
+vae_upscale_factor = 8
 script_directory = os.path.dirname(os.path.abspath(__file__))
 
 device = mm.get_torch_device()

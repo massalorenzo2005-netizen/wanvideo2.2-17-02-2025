@@ -13,7 +13,7 @@ from .wanvideo.wan_video_vae import WanVideoVAE, WanVideoVAE38
 from .custom_linear import _replace_linear
 
 from accelerate import init_empty_weights
-from .utils import set_module_tensor_to_device
+from .utils import set_module_tensor_to_device, get_module_memory_mb_per_device
 
 import folder_paths
 import comfy.model_management as mm
@@ -864,7 +864,7 @@ def load_weights(transformer, sd=None, weight_dtype=None, base_dtype=None,
             )
             transformer.gguf_patched = True
     else:
-        log.info("Using accelerate to load and assign model weights to device...")
+        log.info("Loading and assigning model weights to device...")
     named_params = transformer.named_parameters()
 
     for name, param in tqdm(named_params,
@@ -925,6 +925,11 @@ def load_weights(transformer, sd=None, weight_dtype=None, base_dtype=None,
             pbar.update(100)
 
     #[print(name, param.device, param.dtype) for name, param in transformer.named_parameters()]
+    memory_on_device = get_module_memory_mb_per_device(transformer)
+    log.info("-" * 25)
+    log.info("Transformer weights loaded:")
+    for dev, mem_mb in memory_on_device.items():
+        log.info(f"Device: {dev:8s} | Memory: {mem_mb:,.2f} MB")
 
     pbar.update_absolute(0)
 
@@ -1042,6 +1047,29 @@ class WanVideoSetAttentionModeOverride:
         if blocks is not None:
             attention_mode_override["blocks"] = blocks
         model_clone.model_options['transformer_options']["attention_mode_override"] = attention_mode_override
+
+        return (model_clone,)
+
+
+class WanVideoUltraVicoSettings:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("WANVIDEOMODEL", ),
+                "alpha": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.001, "tooltip": "Alpha value for the decay, higher values mean slower decay"}),
+            },
+        }
+
+    RETURN_TYPES = ("WANVIDEOMODEL",)
+    RETURN_NAMES = ("model", )
+    FUNCTION = "getmodelpath"
+    CATEGORY = "WanVideoWrapper"
+    DESCRIPTION = "Set UltraVico parameters, attention mode still needs to be set to sageattn_ultravico, https://github.com/thu-ml/DiT-Extrapolation"
+
+    def getmodelpath(self, model, alpha):
+        model_clone = model.clone()
+        model_clone.model_options['transformer_options']["ultravico_alpha"] = alpha
 
         return (model_clone,)
 
@@ -1851,6 +1879,7 @@ class WanVideoVAELoader:
                 ),
                 "compile_args": ("WANCOMPILEARGS", ),
                 "use_cpu_cache": ("BOOLEAN", {"default": False, "tooltip": "Reduces VRAM usage, but slows the VAE down a lot"}),
+                "verbose": ("BOOLEAN", {"default": False, "tooltip": "Enables memory usage logging when using the model"}),
             }
         }
 
@@ -1860,7 +1889,7 @@ class WanVideoVAELoader:
     CATEGORY = "WanVideoWrapper"
     DESCRIPTION = "Loads Wan VAE model from 'ComfyUI/models/vae'"
 
-    def loadmodel(self, model_name, precision, compile_args=None, use_cpu_cache=False):
+    def loadmodel(self, model_name, precision, compile_args=None, use_cpu_cache=False, verbose=False):
         dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[precision]
         model_path = folder_paths.get_full_path_or_raise("vae", model_name)
         vae_sd = load_torch_file(model_path, safe_load=True)
@@ -1877,9 +1906,9 @@ class WanVideoVAELoader:
             pruning_rate = 0.0
 
         if vae_sd["model.conv2.weight"].shape[0] == 16:
-            vae = WanVideoVAE(dtype=dtype, pruning_rate=pruning_rate, cpu_cache=use_cpu_cache)
+            vae = WanVideoVAE(dtype=dtype, pruning_rate=pruning_rate, cpu_cache=use_cpu_cache, verbose=verbose)
         elif vae_sd["model.conv2.weight"].shape[0] == 48:
-            vae = WanVideoVAE38(dtype=dtype, pruning_rate=pruning_rate, cpu_cache=use_cpu_cache)
+            vae = WanVideoVAE38(dtype=dtype, pruning_rate=pruning_rate, cpu_cache=use_cpu_cache, verbose=verbose)
 
         vae.load_state_dict(vae_sd)
         del vae_sd
@@ -2092,6 +2121,7 @@ NODE_CLASS_MAPPINGS = {
     "LoadWanVideoT5TextEncoder": LoadWanVideoT5TextEncoder,
     "LoadWanVideoClipTextEncoder": LoadWanVideoClipTextEncoder,
     "WanVideoSetAttentionModeOverride": WanVideoSetAttentionModeOverride,
+    "WanVideoUltraVicoSettings": WanVideoUltraVicoSettings,
     }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -2111,4 +2141,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LoadWanVideoT5TextEncoder": "WanVideo T5 Text Encoder Loader",
     "LoadWanVideoClipTextEncoder": "WanVideo CLIP Text Encoder Loader",
     "WanVideoSetAttentionModeOverride": "WanVideo Set Attention Mode Override",
+    "WanVideoUltraVicoSettings": "WanVideo UltraVico Settings"
     }
