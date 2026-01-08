@@ -225,6 +225,7 @@ class WanVideoSampler:
         #I2V
         story_mem_latents = image_embeds.get("story_mem_latents", None)
         image_cond = image_embeds.get("image_embeds", None)
+        image_cond_mask = None  # ✅ 关键：无论是否使用 mask，都先初始化
         if image_cond is not None:
             if transformer.in_dim == 16:
                 raise ValueError("T2V (text to video) model detected, encoded images only work with I2V (Image to video) models")
