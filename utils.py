@@ -190,9 +190,9 @@ def set_module_tensor_to_device(module, tensor_name, device, value=None, dtype=N
             device = device_quantization
         if is_buffer:
             module._buffers[tensor_name] = new_value
-        elif value is not None or not check_device_same(torch.device(device), module._parameters[tensor_name].device):
+        elif value is not None or not check_device_same(device, module._parameters[tensor_name].device):
             param_cls = type(module._parameters[tensor_name])
-            new_value = param_cls(new_value, requires_grad=False).to(device)
+            new_value = param_cls(new_value, requires_grad=False)
             module._parameters[tensor_name] = new_value
 
     #if device != "cpu":

@@ -2,6 +2,7 @@ import os, gc, math
 import torch
 import torch.nn.functional as F
 import hashlib
+from tqdm import tqdm
 
 from .utils import(log, clip_encode_image_tiled, add_noise_to_reference_video, set_module_tensor_to_device)
 from .taehv import TAEHV
@@ -366,10 +367,18 @@ class WanVideoTextEncode:
             cast_dtype = encoder.dtype
 
         params_to_keep = {'norm', 'pos_embedding', 'token_embedding'}
-        for name, param in encoder.model.named_parameters():
+        if hasattr(encoder, 'state_dict'):
+            model_state_dict = encoder.state_dict
+        else:
+            model_state_dict = encoder.model.state_dict()
+
+        params_list = list(encoder.model.named_parameters())
+        pbar = tqdm(params_list, desc="Loading T5 parameters", leave=True)
+        for name, param in pbar:
             dtype_to_use = dtype if any(keyword in name for keyword in params_to_keep) else cast_dtype
-            value = encoder.state_dict[name] if hasattr(encoder, 'state_dict') else encoder.model.state_dict()[name]
+            value = model_state_dict[name]
             set_module_tensor_to_device(encoder.model, name, device=device_to, dtype=dtype_to_use, value=value)
+        del model_state_dict
         if hasattr(encoder, 'state_dict'):
             del encoder.state_dict
             mm.soft_empty_cache()
