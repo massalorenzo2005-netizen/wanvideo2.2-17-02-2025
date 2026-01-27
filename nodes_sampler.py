@@ -1160,6 +1160,26 @@ class WanVideoSampler:
                 prev_ones = torch.ones(20, *prev_latents.shape[1:], device=device, dtype=dtype)
                 dual_control_input["prev_latent"] = torch.cat([prev_ones, prev_latents]).unsqueeze(0)
 
+        # Self-refine video
+        self_refine_video_enabled = False
+        stochastic_step_map = {}
+        self_refine_uncertainty_threshold = image_embeds.get("self_refine_uncertainty_threshold", None)
+        if self_refine_uncertainty_threshold is not None and context_options is None:
+            self_refine_video_enabled = True
+            stochastic_plan = image_embeds.get("stochastic_plan", [(2, 5, 3), (6, 14, 1)])
+            certain_percentage = image_embeds.get("self_refine_certain_percentage", 0.999)
+            # Build step map: denoising_iteration -> num_anneal_steps
+            for start, end, steps in stochastic_plan:
+                for idx in range(start, end + 1):
+                    stochastic_step_map[idx] = steps
+            log.info("Self-refine video enabled:")
+            log.info(f"  Uncertainty threshold: {self_refine_uncertainty_threshold}")
+            log.info(f"  Certain percentage: {certain_percentage}")
+            log.info(f"  Stochastic plan (steps start-end: P&P iterations):")
+            for start, end, steps in stochastic_plan:
+                log.info(f"    Steps {start}-{end}: {steps} P&P iteration{'s' if steps != 1 else ''}")
+            log.info(f"  Total denoising steps with P&P: {len(stochastic_step_map)}")
+
         #region model pred
         def predict_with_cfg(z, cfg_scale, positive_embeds, negative_embeds, timestep, idx, image_cond=None, clip_fea=None,
                              control_latents=None, vace_data=None, unianim_data=None, audio_proj=None, control_camera_latents=None,
@@ -1796,791 +1816,872 @@ class WanVideoSampler:
                         latent_flipped = torch.flip(latent, dims=[1])
                         latent_model_input_flipped = latent_flipped.to(device)
 
-                    self.noise_front_pad_num = 0
+                    if self_refine_video_enabled:
+                        certain_percentage: float = image_embeds.get("self_refine_certain_percentage", 0.999) # if the certain region is more than this percentage, set certain_flag to True
+                        # Get number of P&P iterations for this noise level
+                        current_num_anneal_steps = stochastic_step_map.get(idx, 0)
+                        in_stoch = current_num_anneal_steps > 0
 
-                    #InfiniteTalk first frame handling
-                    if (extra_latents is not None
-                        and not multitalk_sampling
-                        and transformer.multitalk_model_type=="InfiniteTalk"):
-                        for entry in extra_latents:
-                            add_index = entry["index"]
-                            num_extra_frames = entry["samples"].shape[2]
-                            latent[:, add_index:add_index+num_extra_frames] = entry["samples"].to(latent)
+                        # m = number of vector-predictions at this step
+                        # If stochastic: 1 (initial) + anneal_steps (re-noised predictions)
+                        m = current_num_anneal_steps + 1 if in_stoch else 1
 
-                    latent_model_input = latent.to(device)
-                    latent_model_input_ovi = latent_ovi.to(device) if latent_ovi is not None else None
+                        if sample_scheduler._step_index is None:
+                            tqdm.write("Initializing step index for self-refine scheduler")
+                            sample_scheduler._init_step_index(t)
+                        sigma = sample_scheduler.sigmas[sample_scheduler._step_index].to(device)
+                        sigma_next = sample_scheduler.sigmas[sample_scheduler._step_index + 1].to(device)
+                        buffer = [None] # tuple (certain_mask, pred_original_sample, latents_next)
+                        certain_mask = None
+                        certain_flag = False
+                        m = current_num_anneal_steps + 1 if in_stoch else 1
 
-                    current_step_percentage = idx / len(timesteps)
+                        stoch_bar_context = tqdm(total=current_num_anneal_steps) if in_stoch else nullcontext()
+                        with stoch_bar_context as stoch_bar:
+                            for ii in range(m):
+                                if certain_flag:
+                                    latent = buffer[-1][2]
+                                    break
 
-                    timestep = torch.tensor([t]).to(device)
-                    if is_pusa or ((is_5b or transformer.is_longcat) and clean_latent_indices):
-                        orig_timestep = timestep
-                        timestep = timestep.unsqueeze(1).repeat(1, latent_video_length)
-                        if extra_latents is not None:
-                            if clean_latent_indices and noise_multipliers is not None:
-                                if is_pusa:
-                                    scheduler_step_args["cond_frame_latent_indices"] = clean_latent_indices
-                                    scheduler_step_args["noise_multipliers"] = noise_multipliers
-                                for latent_idx in clean_latent_indices:
-                                    timestep[:, latent_idx] = timestep[:, latent_idx] * noise_multipliers[latent_idx]
-                                    # add noise for conditioning frames if multiplier > 0
-                                    if idx < pusa_noisy_steps and noise_multipliers[latent_idx] > 0:
-                                        latent_size = (1, latent.shape[0], latent.shape[1], latent.shape[2], latent.shape[3])
-                                        noise_for_cond = torch.randn(latent_size, generator=seed_g, device=torch.device("cpu"))
-                                        timestep_cond = torch.ones_like(timestep) * timestep.max()
-                                        if is_pusa:
-                                            latent[:, latent_idx:latent_idx+1] = sample_scheduler.add_noise_for_conditioning_frames(
-                                                latent[:, latent_idx:latent_idx+1].to(device),
-                                                noise_for_cond[:, :, latent_idx:latent_idx+1].to(device),
-                                                timestep_cond[:, latent_idx:latent_idx+1].to(device),
-                                                noise_multiplier=noise_multipliers[latent_idx])
-                            else:
-                                timestep[:, clean_latent_indices] = 0
-                            #print("timestep: ", timestep)
+                                if ii == 0: # first prediction step
+                                    latent_model_input = latent.to(device)
+                                else: # Perturbation step in Eq. 6 of the paper
+                                    noise = torch.randn(latent.shape, generator=seed_g, device=torch.device("cpu"), dtype=latent.dtype)
+                                    latent = (1.0 - sigma) * buffer[-1][1] + sigma * noise.to(latent)
+                                    latent_model_input = latent.to(device)
+                                latent_model_input_ovi = latent_ovi.to(device) if latent_ovi is not None else None
+                                timestep = torch.tensor([t]).to(device)
+                                latent = latent.to(device)
 
-                    ### latent shift
-                    if latent_shift_loop:
-                        if latent_shift_start_percent <= current_step_percentage <= latent_shift_end_percent:
-                            latent_model_input = torch.cat([latent_model_input[:, shift_idx:]] + [latent_model_input[:, :shift_idx]], dim=1)
+                                noise_pred, noise_pred_ovi, self.cache_state = predict_with_cfg(
+                                    latent_model_input,
+                                    cfg[idx], text_embeds["prompt_embeds"], text_embeds["negative_prompt_embeds"],
+                                    timestep, idx, image_cond, clip_fea, control_latents, vace_data, unianim_data, audio_proj, control_camera_latents, add_cond,
+                                    cache_state=self.cache_state, fantasy_portrait_input=fantasy_portrait_input, multitalk_audio_embeds=multitalk_audio_embeds, mtv_motion_tokens=mtv_motion_tokens, s2v_audio_input=s2v_audio_input,
+                                    humo_image_cond=humo_image_cond, humo_image_cond_neg=humo_image_cond_neg, humo_audio=humo_audio, humo_audio_neg=humo_audio_neg,
+                                    wananim_face_pixels=wananim_face_pixels, wananim_pose_latents=wananim_pose_latents, uni3c_data = uni3c_data, latent_model_input_ovi=latent_model_input_ovi, flashvsr_LQ_latent=flashvsr_LQ_latent,
+                                )
+                                pred_original_sample = latent - sigma * noise_pred
+                                latent_next = latent + (sigma_next - sigma) * noise_pred
+                                if in_stoch: # stochastic sampling
+                                    if buffer[-1] is not None: # if buffer is not empty
+                                        # Compute uncertainty per spatial-temporal location
+                                        diff = pred_original_sample - buffer[-1][1]
+                                        uncertainty = torch.sqrt(torch.sum(diff ** 2, dim=0)) / 16  # f, h, w
+                                        certain_mask = uncertainty < self_refine_uncertainty_threshold # certain region, e.g., background
+                                        if buffer[-1][0] is not None:
+                                            certain_mask = certain_mask | buffer[-1][0] # update certain mask (union)
+                                        # if the certain region is more than this percentage, set certain_flag to True
+                                        if certain_mask.sum() / certain_mask.numel() > certain_percentage:
+                                            certain_flag = True
+                                            tqdm.write(f"{ii}/{current_num_anneal_steps}: Certain region is more than {certain_percentage}, set certain_flag to True")
+                                        certain_mask_float = certain_mask.float().unsqueeze(0)  # 1, f, h, w to broadcast with c, f, h, w
+                                        latent_next = certain_mask_float * buffer[-1][2] + (1.0 - certain_mask_float) * latent_next
+                                        pred_original_sample = certain_mask_float * buffer[-1][1] + (1.0 - certain_mask_float) * pred_original_sample
+                                    buffer.append([certain_mask, pred_original_sample, latent_next])
 
-                    #enhance-a-video
-                    enhance_enabled = False
-                    if feta_args is not None and feta_start_percent <= current_step_percentage <= feta_end_percent:
-                        enhance_enabled = True
-                    #region context windowing
-                    if context_options is not None:
-                        counter = torch.zeros_like(latent_model_input, device=device)
-                        noise_pred = torch.zeros_like(latent_model_input, device=device)
-                        context_queue = list(context(idx, steps, latent_video_length, context_frames, context_stride, context_overlap))
-                        fraction_per_context = 1.0 / len(context_queue)
-                        context_pbar = ProgressBar(steps)
-                        step_start_progress = idx
+                                    if ii == m - 1: # finish the last step in P&P iterations
+                                        latent = buffer[-1][2]
 
-                        # Validate all context windows before processing
-                        max_idx = latent_model_input.shape[1] if latent_model_input.ndim > 1 else 0
-                        for window_indices in context_queue:
-                            if not all(0 <= idx < max_idx for idx in window_indices):
-                                raise ValueError(f"Invalid context window indices {window_indices} for latent_model_input with shape {latent_model_input.shape}")
+                                else: # base ODE step
+                                    latent = latent_next
 
-                        for i, c in enumerate(context_queue):
-                            window_id = self.window_tracker.get_window_id(c)
+                                if in_stoch and ii > 0 and stoch_bar is not None:
+                                    stoch_bar.update()
+                                    if callback is not None:
+                                        callback_latent = (latent_model_input.to(device) - noise_pred.to(device) * t.to(device) / 1000).detach()
+                                        callback(idx, callback_latent.permute(1,0,2,3), None, len(timesteps))
 
-                            if cache_args is not None:
-                                current_teacache = self.window_tracker.get_teacache(window_id, self.cache_state)
-                            else:
-                                current_teacache = None
+                        sample_scheduler._step_index += 1
+                        if callback is not None:
+                            callback_latent = (latent_model_input.to(device) - noise_pred.to(device) * t.to(device) / 1000).detach()
+                            callback(idx, callback_latent.permute(1,0,2,3), None, len(timesteps))
+                    else:
+                        self.noise_front_pad_num = 0
 
-                            prompt_index = min(int(max(c) / section_size), num_prompts - 1)
-                            if context_options["verbose"]:
-                                log.info(f"Prompt index: {prompt_index}")
+                        #InfiniteTalk first frame handling
+                        if (extra_latents is not None
+                            and not multitalk_sampling
+                            and transformer.multitalk_model_type=="InfiniteTalk"):
+                            for entry in extra_latents:
+                                add_index = entry["index"]
+                                num_extra_frames = entry["samples"].shape[2]
+                                latent[:, add_index:add_index+num_extra_frames] = entry["samples"].to(latent)
 
-                            # Use the appropriate prompt for this section
-                            if len(text_embeds["prompt_embeds"]) > 1:
-                                positive = [text_embeds["prompt_embeds"][prompt_index]]
-                            else:
-                                positive = text_embeds["prompt_embeds"]
+                        latent_model_input = latent.to(device)
+                        latent_model_input_ovi = latent_ovi.to(device) if latent_ovi is not None else None
 
-                            partial_img_emb = partial_control_latents = None
-                            if image_cond is not None:
-                                partial_img_emb = image_cond[:, c].to(device)
-                                if c[0] != 0 and context_reference_latent is not None:
-                                    if context_reference_latent.shape[0] == 1: #only single extra init latent
-                                        new_init_image = context_reference_latent[0, :, 0].to(device)
-                                        # Concatenate the first 4 channels of partial_img_emb with new_init_image to match the required shape
-                                        partial_img_emb[:, 0] = torch.cat([image_cond[:4, 0].to(device), new_init_image], dim=0)
-                                    elif context_reference_latent.shape[0] > 1:
-                                        num_extra_inits = context_reference_latent.shape[0]
-                                        section_size = (latent_video_length / num_extra_inits)
-                                        extra_init_index = min(int(max(c) / section_size), num_extra_inits - 1)
-                                        if context_options["verbose"]:
-                                            log.info(f"extra init image index: {extra_init_index}")
-                                        new_init_image = context_reference_latent[extra_init_index, :, 0].to(device)
-                                        partial_img_emb[:, 0] = torch.cat([image_cond[:4, 0].to(device), new_init_image], dim=0)
+                        current_step_percentage = idx / len(timesteps)
+
+                        timestep = torch.tensor([t]).to(device)
+                        if is_pusa or ((is_5b or transformer.is_longcat) and clean_latent_indices):
+                            orig_timestep = timestep
+                            timestep = timestep.unsqueeze(1).repeat(1, latent_video_length)
+                            if extra_latents is not None:
+                                if clean_latent_indices and noise_multipliers is not None:
+                                    if is_pusa:
+                                        scheduler_step_args["cond_frame_latent_indices"] = clean_latent_indices
+                                        scheduler_step_args["noise_multipliers"] = noise_multipliers
+                                    for latent_idx in clean_latent_indices:
+                                        timestep[:, latent_idx] = timestep[:, latent_idx] * noise_multipliers[latent_idx]
+                                        # add noise for conditioning frames if multiplier > 0
+                                        if idx < pusa_noisy_steps and noise_multipliers[latent_idx] > 0:
+                                            latent_size = (1, latent.shape[0], latent.shape[1], latent.shape[2], latent.shape[3])
+                                            noise_for_cond = torch.randn(latent_size, generator=seed_g, device=torch.device("cpu"))
+                                            timestep_cond = torch.ones_like(timestep) * timestep.max()
+                                            if is_pusa:
+                                                latent[:, latent_idx:latent_idx+1] = sample_scheduler.add_noise_for_conditioning_frames(
+                                                    latent[:, latent_idx:latent_idx+1].to(device),
+                                                    noise_for_cond[:, :, latent_idx:latent_idx+1].to(device),
+                                                    timestep_cond[:, latent_idx:latent_idx+1].to(device),
+                                                    noise_multiplier=noise_multipliers[latent_idx])
                                 else:
-                                    new_init_image = image_cond[:, 0].to(device)
-                                    partial_img_emb[:, 0] = new_init_image
+                                    timestep[:, clean_latent_indices] = 0
+                                #print("timestep: ", timestep)
 
-                                if control_latents is not None:
-                                    partial_control_latents = control_latents[:, c]
+                        ### latent shift
+                        if latent_shift_loop:
+                            if latent_shift_start_percent <= current_step_percentage <= latent_shift_end_percent:
+                                latent_model_input = torch.cat([latent_model_input[:, shift_idx:]] + [latent_model_input[:, :shift_idx]], dim=1)
 
-                            partial_control_camera_latents = None
-                            if control_camera_latents is not None:
-                                partial_control_camera_latents = control_camera_latents[:, :, c]
+                        #enhance-a-video
+                        enhance_enabled = False
+                        if feta_args is not None and feta_start_percent <= current_step_percentage <= feta_end_percent:
+                            enhance_enabled = True
+                        #region context windowing
+                        if context_options is not None:
+                            counter = torch.zeros_like(latent_model_input, device=device)
+                            noise_pred = torch.zeros_like(latent_model_input, device=device)
+                            context_queue = list(context(idx, steps, latent_video_length, context_frames, context_stride, context_overlap))
+                            fraction_per_context = 1.0 / len(context_queue)
+                            context_pbar = ProgressBar(steps)
+                            step_start_progress = idx
 
-                            partial_vace_context = None
-                            if vace_data is not None:
-                                window_vace_data = []
-                                for vace_entry in vace_data:
-                                    partial_context = vace_entry["context"][0][:, c]
-                                    if has_ref:
-                                        if c[0] != 0 and context_reference_latent is not None:
-                                            if context_reference_latent.shape[0] == 1: #only single extra init latent
-                                                partial_context[16:32, :1] = context_reference_latent[0, :, :1].to(device)
-                                            elif context_reference_latent.shape[0] > 1:
-                                                num_extra_inits = context_reference_latent.shape[0]
-                                                section_size = (latent_video_length / num_extra_inits)
-                                                extra_init_index = min(int(max(c) / section_size), num_extra_inits - 1)
-                                                if context_options["verbose"]:
-                                                    log.info(f"extra init image index: {extra_init_index}")
-                                                partial_context[16:32, :1] = context_reference_latent[extra_init_index, :, :1].to(device)
-                                        else:
-                                            partial_context[:, 0] = vace_entry["context"][0][:, 0]
+                            # Validate all context windows before processing
+                            max_idx = latent_model_input.shape[1] if latent_model_input.ndim > 1 else 0
+                            for window_indices in context_queue:
+                                if not all(0 <= idx < max_idx for idx in window_indices):
+                                    raise ValueError(f"Invalid context window indices {window_indices} for latent_model_input with shape {latent_model_input.shape}")
 
-                                    window_vace_data.append({
-                                        "context": [partial_context],
-                                        "scale": vace_entry["scale"],
-                                        "start": vace_entry["start"],
-                                        "end": vace_entry["end"],
-                                        "seq_len": vace_entry["seq_len"]
-                                    })
+                            for i, c in enumerate(context_queue):
+                                window_id = self.window_tracker.get_window_id(c)
 
-                                partial_vace_context = window_vace_data
+                                if cache_args is not None:
+                                    current_teacache = self.window_tracker.get_teacache(window_id, self.cache_state)
+                                else:
+                                    current_teacache = None
 
-                            partial_audio_proj = None
-                            if fantasytalking_embeds is not None:
-                                partial_audio_proj = audio_proj[:, c]
-
-                            partial_fantasy_portrait_input = None
-                            if fantasy_portrait_input is not None:
-                                partial_fantasy_portrait_input = fantasy_portrait_input.copy()
-                                partial_fantasy_portrait_input["adapter_proj"] = fantasy_portrait_input["adapter_proj"][:, c]
-
-                            partial_latent_model_input = latent_model_input[:, c]
-                            if latents_to_insert is not None and c[0] != 0:
-                                partial_latent_model_input[:, :1] = latents_to_insert
-
-                            partial_unianim_data = None
-                            if unianim_data is not None:
-                                partial_dwpose = dwpose_data[:, :, c]
-                                partial_unianim_data = {
-                                    "dwpose": partial_dwpose,
-                                    "random_ref": unianim_data["random_ref"],
-                                    "strength": unianimate_poses["strength"],
-                                    "start_percent": unianimate_poses["start_percent"],
-                                    "end_percent": unianimate_poses["end_percent"]
-                                }
-
-                            partial_mtv_motion_tokens = None
-                            if mtv_input is not None:
-                                start_token_index = c[0] * 24
-                                end_token_index = (c[-1] + 1) * 24
-                                partial_mtv_motion_tokens = mtv_motion_tokens[:, start_token_index:end_token_index, :]
+                                prompt_index = min(int(max(c) / section_size), num_prompts - 1)
                                 if context_options["verbose"]:
-                                    log.info(f"context window: {c}")
-                                    log.info(f"motion_token_indices: {start_token_index}-{end_token_index}")
+                                    log.info(f"Prompt index: {prompt_index}")
 
-                            partial_s2v_audio_input = None
-                            if s2v_audio_input is not None:
-                                audio_start = c[0] * 4
-                                audio_end = c[-1] * 4 + 1
-                                center_indices = torch.arange(audio_start, audio_end, 1)
-                                center_indices = torch.clamp(center_indices, min=0, max=s2v_audio_input.shape[-1] - 1)
-                                partial_s2v_audio_input = s2v_audio_input[..., center_indices]
+                                # Use the appropriate prompt for this section
+                                if len(text_embeds["prompt_embeds"]) > 1:
+                                    positive = [text_embeds["prompt_embeds"][prompt_index]]
+                                else:
+                                    positive = text_embeds["prompt_embeds"]
 
-                            partial_s2v_pose = None
+                                partial_img_emb = partial_control_latents = None
+                                if image_cond is not None:
+                                    partial_img_emb = image_cond[:, c].to(device)
+                                    if c[0] != 0 and context_reference_latent is not None:
+                                        if context_reference_latent.shape[0] == 1: #only single extra init latent
+                                            new_init_image = context_reference_latent[0, :, 0].to(device)
+                                            # Concatenate the first 4 channels of partial_img_emb with new_init_image to match the required shape
+                                            partial_img_emb[:, 0] = torch.cat([image_cond[:4, 0].to(device), new_init_image], dim=0)
+                                        elif context_reference_latent.shape[0] > 1:
+                                            num_extra_inits = context_reference_latent.shape[0]
+                                            section_size = (latent_video_length / num_extra_inits)
+                                            extra_init_index = min(int(max(c) / section_size), num_extra_inits - 1)
+                                            if context_options["verbose"]:
+                                                log.info(f"extra init image index: {extra_init_index}")
+                                            new_init_image = context_reference_latent[extra_init_index, :, 0].to(device)
+                                            partial_img_emb[:, 0] = torch.cat([image_cond[:4, 0].to(device), new_init_image], dim=0)
+                                    else:
+                                        new_init_image = image_cond[:, 0].to(device)
+                                        partial_img_emb[:, 0] = new_init_image
+
+                                    if control_latents is not None:
+                                        partial_control_latents = control_latents[:, c]
+
+                                partial_control_camera_latents = None
+                                if control_camera_latents is not None:
+                                    partial_control_camera_latents = control_camera_latents[:, :, c]
+
+                                partial_vace_context = None
+                                if vace_data is not None:
+                                    window_vace_data = []
+                                    for vace_entry in vace_data:
+                                        partial_context = vace_entry["context"][0][:, c]
+                                        if has_ref:
+                                            if c[0] != 0 and context_reference_latent is not None:
+                                                if context_reference_latent.shape[0] == 1: #only single extra init latent
+                                                    partial_context[16:32, :1] = context_reference_latent[0, :, :1].to(device)
+                                                elif context_reference_latent.shape[0] > 1:
+                                                    num_extra_inits = context_reference_latent.shape[0]
+                                                    section_size = (latent_video_length / num_extra_inits)
+                                                    extra_init_index = min(int(max(c) / section_size), num_extra_inits - 1)
+                                                    if context_options["verbose"]:
+                                                        log.info(f"extra init image index: {extra_init_index}")
+                                                    partial_context[16:32, :1] = context_reference_latent[extra_init_index, :, :1].to(device)
+                                            else:
+                                                partial_context[:, 0] = vace_entry["context"][0][:, 0]
+
+                                        window_vace_data.append({
+                                            "context": [partial_context],
+                                            "scale": vace_entry["scale"],
+                                            "start": vace_entry["start"],
+                                            "end": vace_entry["end"],
+                                            "seq_len": vace_entry["seq_len"]
+                                        })
+
+                                    partial_vace_context = window_vace_data
+
+                                partial_audio_proj = None
+                                if fantasytalking_embeds is not None:
+                                    partial_audio_proj = audio_proj[:, c]
+
+                                partial_fantasy_portrait_input = None
+                                if fantasy_portrait_input is not None:
+                                    partial_fantasy_portrait_input = fantasy_portrait_input.copy()
+                                    partial_fantasy_portrait_input["adapter_proj"] = fantasy_portrait_input["adapter_proj"][:, c]
+
+                                partial_latent_model_input = latent_model_input[:, c]
+                                if latents_to_insert is not None and c[0] != 0:
+                                    partial_latent_model_input[:, :1] = latents_to_insert
+
+                                partial_unianim_data = None
+                                if unianim_data is not None:
+                                    partial_dwpose = dwpose_data[:, :, c]
+                                    partial_unianim_data = {
+                                        "dwpose": partial_dwpose,
+                                        "random_ref": unianim_data["random_ref"],
+                                        "strength": unianimate_poses["strength"],
+                                        "start_percent": unianimate_poses["start_percent"],
+                                        "end_percent": unianimate_poses["end_percent"]
+                                    }
+
+                                partial_mtv_motion_tokens = None
+                                if mtv_input is not None:
+                                    start_token_index = c[0] * 24
+                                    end_token_index = (c[-1] + 1) * 24
+                                    partial_mtv_motion_tokens = mtv_motion_tokens[:, start_token_index:end_token_index, :]
+                                    if context_options["verbose"]:
+                                        log.info(f"context window: {c}")
+                                        log.info(f"motion_token_indices: {start_token_index}-{end_token_index}")
+
+                                partial_s2v_audio_input = None
+                                if s2v_audio_input is not None:
+                                    audio_start = c[0] * 4
+                                    audio_end = c[-1] * 4 + 1
+                                    center_indices = torch.arange(audio_start, audio_end, 1)
+                                    center_indices = torch.clamp(center_indices, min=0, max=s2v_audio_input.shape[-1] - 1)
+                                    partial_s2v_audio_input = s2v_audio_input[..., center_indices]
+
+                                partial_s2v_pose = None
+                                if s2v_pose is not None:
+                                    partial_s2v_pose = s2v_pose[:, :, c].to(device, dtype)
+
+                                partial_add_cond = None
+                                if add_cond is not None:
+                                    partial_add_cond = add_cond[:, :, c].to(device, dtype)
+
+                                partial_wananim_face_pixels = partial_wananim_pose_latents = None
+                                if wananim_face_pixels is not None and partial_wananim_face_pixels is None:
+                                    start = c[0] * 4
+                                    end = c[-1] * 4
+                                    center_indices = torch.arange(start, end, 1)
+                                    center_indices = torch.clamp(center_indices, min=0, max=wananim_face_pixels.shape[2] - 1)
+                                    partial_wananim_face_pixels = wananim_face_pixels[:, :, center_indices].to(device, dtype)
+                                if wananim_pose_latents is not None:
+                                    start = c[0]
+                                    end = c[-1]
+                                    center_indices = torch.arange(start, end, 1)
+                                    center_indices = torch.clamp(center_indices, min=0, max=wananim_pose_latents.shape[2] - 1)
+                                    partial_wananim_pose_latents = wananim_pose_latents[:, :, center_indices][:, :, :context_frames-1].to(device, dtype)
+
+                                partial_flashvsr_LQ_latent = None
+                                if LQ_images is not None:
+                                    start = c[0] * 4
+                                    end = c[-1] * 4 + 1 + 4
+                                    center_indices = torch.arange(start, end, 1)
+                                    center_indices = torch.clamp(center_indices, min=0, max=LQ_images.shape[2] - 1)
+                                    partial_flashvsr_LQ_images = LQ_images[:, :, center_indices].to(device)
+                                    partial_flashvsr_LQ_latent = transformer.LQ_proj_in(partial_flashvsr_LQ_images)
+
+                                if len(timestep.shape) != 1:
+                                    partial_timestep = timestep[:, c]
+                                    partial_timestep[:, :1] = 0
+                                else:
+                                    partial_timestep = timestep
+
+                                orig_model_input_frames = partial_latent_model_input.shape[1]
+
+                                noise_pred_context, _, new_teacache = predict_with_cfg(
+                                    partial_latent_model_input,
+                                    cfg[idx], positive,
+                                    text_embeds["negative_prompt_embeds"],
+                                    partial_timestep, idx, partial_img_emb, clip_fea, partial_control_latents, partial_vace_context, partial_unianim_data,partial_audio_proj,
+                                    partial_control_camera_latents, partial_add_cond, current_teacache, context_window=c, fantasy_portrait_input=partial_fantasy_portrait_input,
+                                    mtv_motion_tokens=partial_mtv_motion_tokens, s2v_audio_input=partial_s2v_audio_input, s2v_motion_frames=[1, 0], s2v_pose=partial_s2v_pose,
+                                    humo_image_cond=humo_image_cond, humo_image_cond_neg=humo_image_cond_neg, humo_audio=humo_audio, humo_audio_neg=humo_audio_neg,
+                                    wananim_face_pixels=partial_wananim_face_pixels, wananim_pose_latents=partial_wananim_pose_latents, multitalk_audio_embeds=multitalk_audio_embeds,
+                                    uni3c_data=uni3c_data, flashvsr_LQ_latent=partial_flashvsr_LQ_latent)
+
+                                if cache_args is not None:
+                                    self.window_tracker.cache_states[window_id] = new_teacache
+
+                                if mocha_embeds is not None:
+                                    noise_pred_context = noise_pred_context[:, :orig_model_input_frames]
+
+                                window_mask = create_window_mask(noise_pred_context, c, noise.shape[1], context_overlap, looped=is_looped, window_type=context_options["fuse_method"])
+                                noise_pred[:, c] += noise_pred_context * window_mask
+                                counter[:, c] += window_mask
+                                context_pbar.update_absolute(step_start_progress + (i + 1) * fraction_per_context, len(timesteps))
+                            noise_pred /= counter
+                        #region multitalk
+                        elif multitalk_sampling:
+                            return multitalk_loop(**locals())
+                        # region framepack loop
+                        elif framepack:
+                            framepack_out = []
+                            ref_motion_image = None
+                            #infer_frames = image_embeds["num_frames"]
+                            infer_frames = s2v_audio_embeds.get("frame_window_size", 80)
+                            motion_frames = infer_frames - 7 #73 default
+                            lat_motion_frames = (motion_frames + 3) // 4
+                            lat_target_frames = (infer_frames + 3 + motion_frames) // 4 - lat_motion_frames
+
+                            step_iteration_count = 0
+                            total_frames = s2v_audio_input.shape[-1]
+
+                            s2v_motion_frames = [motion_frames, lat_motion_frames]
+
+                            noise = torch.randn( #C, T, H, W
+                                48 if is_5b else 16,
+                                    lat_target_frames,
+                                    target_shape[2],
+                                    target_shape[3],
+                                    dtype=torch.float32,
+                                    generator=seed_g,
+                                    device=torch.device("cpu"))
+
+                            seq_len = math.ceil((noise.shape[2] * noise.shape[3]) / 4 * noise.shape[1])
+
+                            if ref_motion_image is None:
+                                ref_motion_image = torch.zeros(
+                                    [1, 3, motion_frames, latent.shape[2]*vae_upscale_factor, latent.shape[3]*vae_upscale_factor],
+                                    dtype=vae.dtype,
+                                    device=device)
+                            videos_last_frames = ref_motion_image
+
                             if s2v_pose is not None:
-                                partial_s2v_pose = s2v_pose[:, :, c].to(device, dtype)
+                                pose_cond_list = []
+                                for r in range(s2v_num_repeat):
+                                    pose_start = r * (infer_frames // 4)
+                                    pose_end = pose_start + (infer_frames // 4)
 
-                            partial_add_cond = None
-                            if add_cond is not None:
-                                partial_add_cond = add_cond[:, :, c].to(device, dtype)
+                                    cond_lat = s2v_pose[:, :, pose_start:pose_end]
 
-                            partial_wananim_face_pixels = partial_wananim_pose_latents = None
-                            if wananim_face_pixels is not None and partial_wananim_face_pixels is None:
-                                start = c[0] * 4
-                                end = c[-1] * 4
-                                center_indices = torch.arange(start, end, 1)
-                                center_indices = torch.clamp(center_indices, min=0, max=wananim_face_pixels.shape[2] - 1)
-                                partial_wananim_face_pixels = wananim_face_pixels[:, :, center_indices].to(device, dtype)
-                            if wananim_pose_latents is not None:
-                                start = c[0]
-                                end = c[-1]
-                                center_indices = torch.arange(start, end, 1)
-                                center_indices = torch.clamp(center_indices, min=0, max=wananim_pose_latents.shape[2] - 1)
-                                partial_wananim_pose_latents = wananim_pose_latents[:, :, center_indices][:, :, :context_frames-1].to(device, dtype)
+                                    pad_len = (infer_frames // 4) - cond_lat.shape[2]
+                                    if pad_len > 0:
+                                        pad = -torch.ones(cond_lat.shape[0], cond_lat.shape[1], pad_len, cond_lat.shape[3], cond_lat.shape[4], device=cond_lat.device, dtype=cond_lat.dtype)
+                                        cond_lat = torch.cat([cond_lat, pad], dim=2)
+                                    pose_cond_list.append(cond_lat.cpu())
 
-                            partial_flashvsr_LQ_latent = None
-                            if LQ_images is not None:
-                                start = c[0] * 4
-                                end = c[-1] * 4 + 1 + 4
-                                center_indices = torch.arange(start, end, 1)
-                                center_indices = torch.clamp(center_indices, min=0, max=LQ_images.shape[2] - 1)
-                                partial_flashvsr_LQ_images = LQ_images[:, :, center_indices].to(device)
-                                partial_flashvsr_LQ_latent = transformer.LQ_proj_in(partial_flashvsr_LQ_images)
-
-                            if len(timestep.shape) != 1:
-                                partial_timestep = timestep[:, c]
-                                partial_timestep[:, :1] = 0
-                            else:
-                                partial_timestep = timestep
-
-                            orig_model_input_frames = partial_latent_model_input.shape[1]
-
-                            noise_pred_context, _, new_teacache = predict_with_cfg(
-                                partial_latent_model_input,
-                                cfg[idx], positive,
-                                text_embeds["negative_prompt_embeds"],
-                                partial_timestep, idx, partial_img_emb, clip_fea, partial_control_latents, partial_vace_context, partial_unianim_data,partial_audio_proj,
-                                partial_control_camera_latents, partial_add_cond, current_teacache, context_window=c, fantasy_portrait_input=partial_fantasy_portrait_input,
-                                mtv_motion_tokens=partial_mtv_motion_tokens, s2v_audio_input=partial_s2v_audio_input, s2v_motion_frames=[1, 0], s2v_pose=partial_s2v_pose,
-                                humo_image_cond=humo_image_cond, humo_image_cond_neg=humo_image_cond_neg, humo_audio=humo_audio, humo_audio_neg=humo_audio_neg,
-                                wananim_face_pixels=partial_wananim_face_pixels, wananim_pose_latents=partial_wananim_pose_latents, multitalk_audio_embeds=multitalk_audio_embeds,
-                                uni3c_data=uni3c_data, flashvsr_LQ_latent=partial_flashvsr_LQ_latent)
-
-                            if cache_args is not None:
-                                self.window_tracker.cache_states[window_id] = new_teacache
-
-                            if mocha_embeds is not None:
-                                noise_pred_context = noise_pred_context[:, :orig_model_input_frames]
-
-                            window_mask = create_window_mask(noise_pred_context, c, noise.shape[1], context_overlap, looped=is_looped, window_type=context_options["fuse_method"])
-                            noise_pred[:, c] += noise_pred_context * window_mask
-                            counter[:, c] += window_mask
-                            context_pbar.update_absolute(step_start_progress + (i + 1) * fraction_per_context, len(timesteps))
-                        noise_pred /= counter
-                    #region multitalk
-                    elif multitalk_sampling:
-                        return multitalk_loop(**locals())
-                    # region framepack loop
-                    elif framepack:
-                        framepack_out = []
-                        ref_motion_image = None
-                        #infer_frames = image_embeds["num_frames"]
-                        infer_frames = s2v_audio_embeds.get("frame_window_size", 80)
-                        motion_frames = infer_frames - 7 #73 default
-                        lat_motion_frames = (motion_frames + 3) // 4
-                        lat_target_frames = (infer_frames + 3 + motion_frames) // 4 - lat_motion_frames
-
-                        step_iteration_count = 0
-                        total_frames = s2v_audio_input.shape[-1]
-
-                        s2v_motion_frames = [motion_frames, lat_motion_frames]
-
-                        noise = torch.randn( #C, T, H, W
-                            48 if is_5b else 16,
-                                lat_target_frames,
-                                target_shape[2],
-                                target_shape[3],
-                                dtype=torch.float32,
-                                generator=seed_g,
-                                device=torch.device("cpu"))
-
-                        seq_len = math.ceil((noise.shape[2] * noise.shape[3]) / 4 * noise.shape[1])
-
-                        if ref_motion_image is None:
-                            ref_motion_image = torch.zeros(
-                                [1, 3, motion_frames, latent.shape[2]*vae_upscale_factor, latent.shape[3]*vae_upscale_factor],
-                                dtype=vae.dtype,
-                                device=device)
-                        videos_last_frames = ref_motion_image
-
-                        if s2v_pose is not None:
-                            pose_cond_list = []
+                            log.info(f"Sampling {total_frames} frames in {s2v_num_repeat} windows, at {latent.shape[3]*vae_upscale_factor}x{latent.shape[2]*vae_upscale_factor} with {steps} steps")
+                            # sample
                             for r in range(s2v_num_repeat):
-                                pose_start = r * (infer_frames // 4)
-                                pose_end = pose_start + (infer_frames // 4)
 
-                                cond_lat = s2v_pose[:, :, pose_start:pose_end]
+                                mm.soft_empty_cache()
+                                gc.collect()
+                                if ref_motion_image is not None:
+                                    vae.to(device)
+                                    ref_motion = vae.encode(ref_motion_image.to(vae.dtype), device=device, pbar=False).to(dtype)[0]
 
-                                pad_len = (infer_frames // 4) - cond_lat.shape[2]
-                                if pad_len > 0:
-                                    pad = -torch.ones(cond_lat.shape[0], cond_lat.shape[1], pad_len, cond_lat.shape[3], cond_lat.shape[4], device=cond_lat.device, dtype=cond_lat.dtype)
-                                    cond_lat = torch.cat([cond_lat, pad], dim=2)
-                                pose_cond_list.append(cond_lat.cpu())
+                                    vae.to(offload_device)
 
-                        log.info(f"Sampling {total_frames} frames in {s2v_num_repeat} windows, at {latent.shape[3]*vae_upscale_factor}x{latent.shape[2]*vae_upscale_factor} with {steps} steps")
-                        # sample
-                        for r in range(s2v_num_repeat):
+                                left_idx = r * infer_frames
+                                right_idx = r * infer_frames + infer_frames
+
+                                s2v_audio_input_slice = s2v_audio_input[..., left_idx:right_idx]
+                                if s2v_audio_input_slice.shape[-1] < (right_idx - left_idx):
+                                    pad_len = (right_idx - left_idx) - s2v_audio_input_slice.shape[-1]
+                                    pad_shape = list(s2v_audio_input_slice.shape)
+                                    pad_shape[-1] = pad_len
+                                    pad = torch.zeros(pad_shape, device=s2v_audio_input_slice.device, dtype=s2v_audio_input_slice.dtype)
+                                    log.info(f"Padding s2v_audio_input_slice from {s2v_audio_input_slice.shape[-1]} to {right_idx - left_idx}")
+                                    s2v_audio_input_slice = torch.cat([s2v_audio_input_slice, pad], dim=-1)
+
+                                if ref_motion_image is not None:
+                                    input_motion_latents = ref_motion.clone().unsqueeze(0)
+                                else:
+                                    input_motion_latents = None
+
+                                s2v_pose_slice = None
+                                if s2v_pose is not None:
+                                    s2v_pose_slice = pose_cond_list[r].to(device)
+
+                                if isinstance(scheduler, dict):
+                                    sample_scheduler = copy.deepcopy(scheduler["sample_scheduler"])
+                                    timesteps = scheduler["timesteps"]
+                                else:
+                                    sample_scheduler, timesteps,_,_ = get_scheduler(scheduler, total_steps, start_step, end_step, shift, device, transformer.dim, denoise_strength, sigmas=sigmas)
+
+                                latent = noise.to(device)
+                                for i, t in enumerate(tqdm(timesteps, desc=f"Sampling audio indices {left_idx}-{right_idx}", position=0)):
+                                    latent_model_input = latent.to(device)
+                                    timestep = torch.tensor([t]).to(device)
+                                    noise_pred, _, self.cache_state = predict_with_cfg(
+                                        latent_model_input,
+                                        cfg[idx],
+                                        text_embeds["prompt_embeds"],
+                                        text_embeds["negative_prompt_embeds"],
+                                        timestep, idx, image_cond, clip_fea, control_latents, vace_data, unianim_data, audio_proj, control_camera_latents, add_cond,
+                                        cache_state=self.cache_state, fantasy_portrait_input=fantasy_portrait_input, mtv_motion_tokens=mtv_motion_tokens,
+                                        s2v_audio_input=s2v_audio_input_slice, s2v_ref_motion=input_motion_latents, s2v_motion_frames=s2v_motion_frames, s2v_pose=s2v_pose_slice)
+
+                                    latent = sample_scheduler.step(
+                                            noise_pred.unsqueeze(0), timestep, latent.unsqueeze(0),
+                                            **scheduler_step_args)[0].squeeze(0)
+                                    if callback is not None:
+                                        callback_latent = (latent_model_input.to(device) - noise_pred.to(device) * t.to(device) / 1000).detach().permute(1,0,2,3)
+                                        callback(step_iteration_count, callback_latent, None, s2v_num_repeat*(len(timesteps)))
+                                        del callback_latent
+                                    step_iteration_count += 1
+                                    del latent_model_input, noise_pred
+
+
+                                vae.to(device)
+                                decode_latents = torch.cat([ref_motion.unsqueeze(0), latent.unsqueeze(0)], dim=2)
+                                image = vae.decode(decode_latents.to(device, vae.dtype), device=device, pbar=False)[0]
+                                del decode_latents
+                                image = image.unsqueeze(0)[:, :, -infer_frames:]
+                                if r == 0:
+                                    image = image[:, :, 3:]
+
+                                framepack_out.append(image.cpu())
+
+                                overlap_frames_num = min(motion_frames, image.shape[2])
+
+                                videos_last_frames = torch.cat([
+                                    videos_last_frames[:, :, overlap_frames_num:],
+                                    image[:, :, -overlap_frames_num:]], dim=2).to(device, vae.dtype)
+
+                                ref_motion_image = videos_last_frames
+
+                            vae.to(offload_device)
 
                             mm.soft_empty_cache()
-                            gc.collect()
-                            if ref_motion_image is not None:
-                                vae.to(device)
-                                ref_motion = vae.encode(ref_motion_image.to(vae.dtype), device=device, pbar=False).to(dtype)[0]
+                            gen_video_samples = torch.cat(framepack_out, dim=2).squeeze(0).permute(1, 2, 3, 0)
+
+                            if force_offload:
+                                if not model["auto_cpu_offload"]:
+                                    offload_transformer(transformer)
+                            try:
+                                print_memory(device)
+                                torch.cuda.reset_peak_memory_stats(device)
+                            except:
+                                pass
+                            return {"video": gen_video_samples},
+                        # region wananimate loop
+                        elif wananimate_loop:
+                            # calculate frame counts
+                            total_frames = num_frames
+                            refert_num = 1
+
+                            real_clip_len = frame_window_size - refert_num
+                            last_clip_num = (total_frames - refert_num) % real_clip_len
+                            extra = 0 if last_clip_num == 0 else real_clip_len - last_clip_num
+                            target_len = total_frames + extra
+                            estimated_iterations = target_len // real_clip_len
+                            target_latent_len = (target_len - 1) // 4 + estimated_iterations
+                            latent_window_size = (frame_window_size - 1) // 4 + 1
+
+                            from .utils import tensor_pingpong_pad
+
+                            ref_latent = image_embeds.get("ref_latent", None)
+                            ref_images = image_embeds.get("ref_image", None)
+                            bg_images = image_embeds.get("bg_images", None)
+                            pose_images = image_embeds.get("pose_images", None)
+
+                            current_ref_images = face_images = face_images_in = None
+
+                            if wananim_face_pixels is not None:
+                                face_images = tensor_pingpong_pad(wananim_face_pixels, target_len)
+                                log.info(f"WanAnimate: Face input {wananim_face_pixels.shape} padded to shape {face_images.shape}")
+                            if wananim_ref_masks is not None:
+                                ref_masks_in = tensor_pingpong_pad(wananim_ref_masks, target_latent_len)
+                                log.info(f"WanAnimate: Ref masks {wananim_ref_masks.shape} padded to shape {ref_masks_in.shape}")
+                            if bg_images is not None:
+                                bg_images_in = tensor_pingpong_pad(bg_images, target_len)
+                                log.info(f"WanAnimate: BG images {bg_images.shape} padded to shape {bg_images.shape}")
+                            if pose_images is not None:
+                                pose_images_in = tensor_pingpong_pad(pose_images, target_len)
+                                log.info(f"WanAnimate: Pose images {pose_images.shape} padded to shape {pose_images_in.shape}")
+
+                            # init variables
+                            offloaded = False
+
+                            colormatch = image_embeds.get("colormatch", "disabled")
+                            output_path = image_embeds.get("output_path", "")
+                            offload = image_embeds.get("force_offload", False)
+
+                            lat_h, lat_w = noise.shape[2], noise.shape[3]
+                            start = start_latent = img_counter = step_iteration_count = iteration_count = 0
+                            end = frame_window_size
+                            end_latent = latent_window_size
+
+
+                            callback = prepare_callback(patcher, estimated_iterations)
+                            log.info(f"Sampling {total_frames} frames in {estimated_iterations} windows, at {latent.shape[3]*vae_upscale_factor}x{latent.shape[2]*vae_upscale_factor} with {steps} steps")
+
+                            # outer WanAnimate loop
+                            gen_video_list = []
+                            while True:
+                                if start + refert_num >= total_frames:
+                                    break
+
+                                mm.soft_empty_cache()
+
+                                mask_reft_len = 0 if start == 0 else refert_num
+
+                                self.cache_state = [None, None]
+
+                                noise = torch.randn(16, latent_window_size + 1, lat_h, lat_w, dtype=torch.float32, device=torch.device("cpu"), generator=seed_g).to(device)
+                                seq_len = math.ceil((noise.shape[2] * noise.shape[3]) / 4 * noise.shape[1])
+
+                                if current_ref_images is not None or bg_images is not None or ref_latent is not None:
+                                    if offload:
+                                        offload_transformer(transformer, remove_lora=False)
+                                        offloaded = True
+                                    vae.to(device)
+                                    if wananim_ref_masks is not None:
+                                        msk = ref_masks_in[:, start_latent:end_latent].to(device, dtype)
+                                    else:
+                                        msk = torch.zeros(4, latent_window_size, lat_h, lat_w, device=device, dtype=dtype)
+                                    if bg_images is not None:
+                                        bg_image_slice = bg_images_in[:, start:end].to(device)
+                                    else:
+                                        bg_image_slice = torch.zeros(3, frame_window_size-refert_num, lat_h * 8, lat_w * 8, device=device, dtype=vae.dtype)
+                                    if mask_reft_len == 0:
+                                        temporal_ref_latents = vae.encode([bg_image_slice], device,tiled=tiled_vae)[0]
+                                    else:
+                                        concatenated = torch.cat([current_ref_images.to(device, dtype=vae.dtype), bg_image_slice[:, mask_reft_len:]], dim=1)
+                                        temporal_ref_latents = vae.encode([concatenated.to(device, vae.dtype)], device,tiled=tiled_vae, pbar=False)[0]
+                                        msk[:, :mask_reft_len] = 1
+
+                                    if msk.shape[1] != temporal_ref_latents.shape[1]:
+                                        if temporal_ref_latents.shape[1] < msk.shape[1]:
+                                            pad_len = msk.shape[1] - temporal_ref_latents.shape[1]
+                                            pad_tensor = temporal_ref_latents[:, -1:].repeat(1, pad_len, 1, 1)
+                                            temporal_ref_latents = torch.cat([temporal_ref_latents, pad_tensor], dim=1)
+                                        else:
+                                            temporal_ref_latents = temporal_ref_latents[:, :msk.shape[1]]
+
+                                    if ref_latent is not None:
+                                        temporal_ref_latents = torch.cat([msk, temporal_ref_latents], dim=0) # 4+C T H W
+                                        image_cond_in = torch.cat([ref_latent.to(device), temporal_ref_latents], dim=1) # 4+C T+trefs H W
+                                        del temporal_ref_latents, msk, bg_image_slice
+                                    else:
+                                        image_cond_in = torch.cat([torch.tile(torch.zeros_like(noise[:1]), [4, 1, 1, 1]), torch.zeros_like(noise)], dim=0).to(device)
+                                else:
+                                    image_cond_in = torch.cat([torch.tile(torch.zeros_like(noise[:1]), [4, 1, 1, 1]), torch.zeros_like(noise)], dim=0).to(device)
+
+                                pose_input_slice = None
+                                if pose_images is not None:
+                                    vae.to(device)
+                                    pose_image_slice = pose_images_in[:, start:end].to(device)
+                                    pose_input_slice = vae.encode([pose_image_slice], device,tiled=tiled_vae, pbar=False).to(dtype)
 
                                 vae.to(offload_device)
 
-                            left_idx = r * infer_frames
-                            right_idx = r * infer_frames + infer_frames
+                                if wananim_face_pixels is None and wananim_ref_masks is not None:
+                                    face_images_in = torch.zeros(1, 3, frame_window_size, 512, 512, device=device, dtype=torch.float32)
+                                elif wananim_face_pixels is not None:
+                                    face_images_in = face_images[:, :, start:end].to(device, torch.float32) if face_images is not None else None
 
-                            s2v_audio_input_slice = s2v_audio_input[..., left_idx:right_idx]
-                            if s2v_audio_input_slice.shape[-1] < (right_idx - left_idx):
-                                pad_len = (right_idx - left_idx) - s2v_audio_input_slice.shape[-1]
-                                pad_shape = list(s2v_audio_input_slice.shape)
-                                pad_shape[-1] = pad_len
-                                pad = torch.zeros(pad_shape, device=s2v_audio_input_slice.device, dtype=s2v_audio_input_slice.dtype)
-                                log.info(f"Padding s2v_audio_input_slice from {s2v_audio_input_slice.shape[-1]} to {right_idx - left_idx}")
-                                s2v_audio_input_slice = torch.cat([s2v_audio_input_slice, pad], dim=-1)
+                                if samples is not None:
+                                    input_samples = samples["samples"]
+                                    if input_samples is not None:
+                                        input_samples = input_samples.squeeze(0).to(noise)
+                                        # Check if we have enough frames in input_samples
+                                        # if latent_end_idx > input_samples.shape[1]:
+                                        #     # We need more frames than available - pad the input_samples at the end
+                                        #     pad_length = latent_end_idx - input_samples.shape[1]
+                                        #     last_frame = input_samples[:, -1:].repeat(1, pad_length, 1, 1)
+                                        #     input_samples = torch.cat([input_samples, last_frame], dim=1)
+                                        # input_samples = input_samples[:, latent_start_idx:latent_end_idx]
+                                        if noise_mask is not None:
+                                            original_image = input_samples.to(device)
 
-                            if ref_motion_image is not None:
-                                input_motion_latents = ref_motion.clone().unsqueeze(0)
-                            else:
-                                input_motion_latents = None
+                                        assert input_samples.shape[1] == noise.shape[1], f"Slice mismatch: {input_samples.shape[1]} vs {noise.shape[1]}"
 
-                            s2v_pose_slice = None
-                            if s2v_pose is not None:
-                                s2v_pose_slice = pose_cond_list[r].to(device)
+                                        if add_noise_to_samples:
+                                            latent_timestep = timesteps[0]
+                                            noise = noise * latent_timestep / 1000 + (1 - latent_timestep / 1000) * input_samples
+                                        else:
+                                            noise = input_samples
 
-                            if isinstance(scheduler, dict):
-                                sample_scheduler = copy.deepcopy(scheduler["sample_scheduler"])
-                                timesteps = scheduler["timesteps"]
-                            else:
-                                sample_scheduler, timesteps,_,_ = get_scheduler(scheduler, total_steps, start_step, end_step, shift, device, transformer.dim, denoise_strength, sigmas=sigmas)
+                                    # diff diff prep
+                                    noise_mask = samples.get("noise_mask", None)
+                                    if noise_mask is not None:
+                                        if len(noise_mask.shape) == 4:
+                                            noise_mask = noise_mask.squeeze(1)
+                                        if noise_mask.shape[0] < noise.shape[1]:
+                                            noise_mask = noise_mask.repeat(noise.shape[1] // noise_mask.shape[0], 1, 1)
+                                        else:
+                                            noise_mask = noise_mask[start_latent:end_latent]
+                                        noise_mask = torch.nn.functional.interpolate(
+                                            noise_mask.unsqueeze(0).unsqueeze(0),  # Add batch and channel dims [1,1,T,H,W]
+                                            size=(noise.shape[1], noise.shape[2], noise.shape[3]),
+                                            mode='trilinear',
+                                            align_corners=False
+                                        ).repeat(1, noise.shape[0], 1, 1, 1)
 
-                            latent = noise.to(device)
-                            for i, t in enumerate(tqdm(timesteps, desc=f"Sampling audio indices {left_idx}-{right_idx}", position=0)):
-                                latent_model_input = latent.to(device)
-                                timestep = torch.tensor([t]).to(device)
-                                noise_pred, _, self.cache_state = predict_with_cfg(
-                                    latent_model_input,
-                                    cfg[idx],
-                                    text_embeds["prompt_embeds"],
-                                    text_embeds["negative_prompt_embeds"],
-                                    timestep, idx, image_cond, clip_fea, control_latents, vace_data, unianim_data, audio_proj, control_camera_latents, add_cond,
-                                    cache_state=self.cache_state, fantasy_portrait_input=fantasy_portrait_input, mtv_motion_tokens=mtv_motion_tokens,
-                                    s2v_audio_input=s2v_audio_input_slice, s2v_ref_motion=input_motion_latents, s2v_motion_frames=s2v_motion_frames, s2v_pose=s2v_pose_slice)
+                                        thresholds = torch.arange(len(timesteps), dtype=original_image.dtype) / len(timesteps)
+                                        thresholds = thresholds.reshape(-1, 1, 1, 1, 1).to(device)
+                                        masks = (1-noise_mask.repeat(len(timesteps), 1, 1, 1, 1).to(device)) > thresholds
 
-                                latent = sample_scheduler.step(
-                                        noise_pred.unsqueeze(0), timestep, latent.unsqueeze(0),
-                                        **scheduler_step_args)[0].squeeze(0)
-                                if callback is not None:
-                                    callback_latent = (latent_model_input.to(device) - noise_pred.to(device) * t.to(device) / 1000).detach().permute(1,0,2,3)
-                                    callback(step_iteration_count, callback_latent, None, s2v_num_repeat*(len(timesteps)))
-                                    del callback_latent
-                                step_iteration_count += 1
-                                del latent_model_input, noise_pred
+                                if isinstance(scheduler, dict):
+                                    sample_scheduler = copy.deepcopy(scheduler["sample_scheduler"])
+                                    timesteps = scheduler["timesteps"]
+                                else:
+                                    sample_scheduler, timesteps,_,_ = get_scheduler(scheduler, total_steps, start_step, end_step, shift, device, transformer.dim, denoise_strength, sigmas=sigmas)
 
+                                # sample videos
+                                latent = noise
 
-                            vae.to(device)
-                            decode_latents = torch.cat([ref_motion.unsqueeze(0), latent.unsqueeze(0)], dim=2)
-                            image = vae.decode(decode_latents.to(device, vae.dtype), device=device, pbar=False)[0]
-                            del decode_latents
-                            image = image.unsqueeze(0)[:, :, -infer_frames:]
-                            if r == 0:
-                                image = image[:, :, 3:]
+                                if offloaded:
+                                    # Load weights
+                                    if transformer.patched_linear and gguf_reader is None:
+                                        load_weights(patcher.model.diffusion_model, patcher.model["sd"], weight_dtype, base_dtype=dtype, transformer_load_device=device, block_swap_args=block_swap_args)
+                                    elif gguf_reader is not None: #handle GGUF
+                                        load_weights(transformer, patcher.model["sd"], base_dtype=dtype, transformer_load_device=device, patcher=patcher, gguf=True, reader=gguf_reader, block_swap_args=block_swap_args)
+                                    #blockswap init
+                                    init_blockswap(transformer, block_swap_args, model)
 
-                            framepack_out.append(image.cpu())
+                                # Use the appropriate prompt for this section
+                                if len(text_embeds["prompt_embeds"]) > 1:
+                                    prompt_index = min(iteration_count, len(text_embeds["prompt_embeds"]) - 1)
+                                    positive = [text_embeds["prompt_embeds"][prompt_index]]
+                                    log.info(f"Using prompt index: {prompt_index}")
+                                else:
+                                    positive = text_embeds["prompt_embeds"]
 
-                            overlap_frames_num = min(motion_frames, image.shape[2])
+                                # uni3c slices
+                                uni3c_data_input = None
+                                if uni3c_embeds is not None:
+                                    render_latent = uni3c_embeds["render_latent"][:,:,start_latent:end_latent].to(device)
+                                    if render_latent.shape[2] < noise.shape[1]:
+                                        render_latent = torch.nn.functional.interpolate(render_latent, size=(noise.shape[1], noise.shape[2], noise.shape[3]), mode='trilinear', align_corners=False)
+                                    uni3c_data_input = {"render_latent": render_latent}
+                                    for k in uni3c_data:
+                                        if k != "render_latent":
+                                            uni3c_data_input[k] = uni3c_data[k]
 
-                            videos_last_frames = torch.cat([
-                                videos_last_frames[:, :, overlap_frames_num:],
-                                image[:, :, -overlap_frames_num:]], dim=2).to(device, vae.dtype)
+                                mm.soft_empty_cache()
+                                gc.collect()
+                                # inner WanAnimate sampling loop
+                                sampling_pbar = tqdm(total=len(timesteps), desc=f"Frames {start}-{end}", position=0, leave=True)
+                                for i in range(len(timesteps)):
+                                    timestep = timesteps[i]
+                                    latent_model_input = latent.to(device)
 
-                            ref_motion_image = videos_last_frames
+                                    noise_pred, _, self.cache_state = predict_with_cfg(
+                                        latent_model_input, cfg[min(i, len(timesteps)-1)], positive, text_embeds["negative_prompt_embeds"],
+                                        timestep, i, cache_state=self.cache_state, image_cond=image_cond_in, clip_fea=clip_fea, wananim_face_pixels=face_images_in,
+                                        wananim_pose_latents=pose_input_slice, uni3c_data=uni3c_data_input,
+                                    )
+                                    if callback is not None:
+                                        callback_latent = (latent_model_input.to(device) - noise_pred.to(device) * t.to(device) / 1000).detach().permute(1,0,2,3)
+                                        callback(step_iteration_count, callback_latent, None, estimated_iterations*(len(timesteps)))
+                                        del callback_latent
 
-                        vae.to(offload_device)
+                                    sampling_pbar.update(1)
+                                    step_iteration_count += 1
 
-                        mm.soft_empty_cache()
-                        gen_video_samples = torch.cat(framepack_out, dim=2).squeeze(0).permute(1, 2, 3, 0)
+                                    if use_tsr:
+                                        noise_pred = temporal_score_rescaling(noise_pred, latent, timestep, tsr_k, tsr_sigma)
 
-                        if force_offload:
-                            if not model["auto_cpu_offload"]:
-                                offload_transformer(transformer)
-                        try:
-                            print_memory(device)
-                            torch.cuda.reset_peak_memory_stats(device)
-                        except:
-                            pass
-                        return {"video": gen_video_samples},
-                    # region wananimate loop
-                    elif wananimate_loop:
-                        # calculate frame counts
-                        total_frames = num_frames
-                        refert_num = 1
+                                    latent = sample_scheduler.step(noise_pred.unsqueeze(0), timestep, latent.unsqueeze(0).to(noise_pred.device), **scheduler_step_args)[0].squeeze(0)
+                                    del noise_pred, latent_model_input, timestep
 
-                        real_clip_len = frame_window_size - refert_num
-                        last_clip_num = (total_frames - refert_num) % real_clip_len
-                        extra = 0 if last_clip_num == 0 else real_clip_len - last_clip_num
-                        target_len = total_frames + extra
-                        estimated_iterations = target_len // real_clip_len
-                        target_latent_len = (target_len - 1) // 4 + estimated_iterations
-                        latent_window_size = (frame_window_size - 1) // 4 + 1
+                                    # differential diffusion inpaint
+                                    if masks is not None:
+                                        if i < len(timesteps) - 1:
+                                            image_latent = add_noise(original_image.to(device), noise.to(device), timesteps[i+1])
+                                            mask = masks[i].to(latent)
+                                            latent = image_latent * mask + latent * (1-mask)
 
-                        from .utils import tensor_pingpong_pad
-
-                        ref_latent = image_embeds.get("ref_latent", None)
-                        ref_images = image_embeds.get("ref_image", None)
-                        bg_images = image_embeds.get("bg_images", None)
-                        pose_images = image_embeds.get("pose_images", None)
-
-                        current_ref_images = face_images = face_images_in = None
-
-                        if wananim_face_pixels is not None:
-                            face_images = tensor_pingpong_pad(wananim_face_pixels, target_len)
-                            log.info(f"WanAnimate: Face input {wananim_face_pixels.shape} padded to shape {face_images.shape}")
-                        if wananim_ref_masks is not None:
-                            ref_masks_in = tensor_pingpong_pad(wananim_ref_masks, target_latent_len)
-                            log.info(f"WanAnimate: Ref masks {wananim_ref_masks.shape} padded to shape {ref_masks_in.shape}")
-                        if bg_images is not None:
-                            bg_images_in = tensor_pingpong_pad(bg_images, target_len)
-                            log.info(f"WanAnimate: BG images {bg_images.shape} padded to shape {bg_images.shape}")
-                        if pose_images is not None:
-                            pose_images_in = tensor_pingpong_pad(pose_images, target_len)
-                            log.info(f"WanAnimate: Pose images {pose_images.shape} padded to shape {pose_images_in.shape}")
-
-                        # init variables
-                        offloaded = False
-
-                        colormatch = image_embeds.get("colormatch", "disabled")
-                        output_path = image_embeds.get("output_path", "")
-                        offload = image_embeds.get("force_offload", False)
-
-                        lat_h, lat_w = noise.shape[2], noise.shape[3]
-                        start = start_latent = img_counter = step_iteration_count = iteration_count = 0
-                        end = frame_window_size
-                        end_latent = latent_window_size
-
-
-                        callback = prepare_callback(patcher, estimated_iterations)
-                        log.info(f"Sampling {total_frames} frames in {estimated_iterations} windows, at {latent.shape[3]*vae_upscale_factor}x{latent.shape[2]*vae_upscale_factor} with {steps} steps")
-
-                        # outer WanAnimate loop
-                        gen_video_list = []
-                        while True:
-                            if start + refert_num >= total_frames:
-                                break
-
-                            mm.soft_empty_cache()
-
-                            mask_reft_len = 0 if start == 0 else refert_num
-
-                            self.cache_state = [None, None]
-
-                            noise = torch.randn(16, latent_window_size + 1, lat_h, lat_w, dtype=torch.float32, device=torch.device("cpu"), generator=seed_g).to(device)
-                            seq_len = math.ceil((noise.shape[2] * noise.shape[3]) / 4 * noise.shape[1])
-
-                            if current_ref_images is not None or bg_images is not None or ref_latent is not None:
+                                del noise
                                 if offload:
                                     offload_transformer(transformer, remove_lora=False)
                                     offloaded = True
+
                                 vae.to(device)
-                                if wananim_ref_masks is not None:
-                                    msk = ref_masks_in[:, start_latent:end_latent].to(device, dtype)
-                                else:
-                                    msk = torch.zeros(4, latent_window_size, lat_h, lat_w, device=device, dtype=dtype)
-                                if bg_images is not None:
-                                    bg_image_slice = bg_images_in[:, start:end].to(device)
-                                else:
-                                    bg_image_slice = torch.zeros(3, frame_window_size-refert_num, lat_h * 8, lat_w * 8, device=device, dtype=vae.dtype)
-                                if mask_reft_len == 0:
-                                    temporal_ref_latents = vae.encode([bg_image_slice], device,tiled=tiled_vae)[0]
-                                else:
-                                    concatenated = torch.cat([current_ref_images.to(device, dtype=vae.dtype), bg_image_slice[:, mask_reft_len:]], dim=1)
-                                    temporal_ref_latents = vae.encode([concatenated.to(device, vae.dtype)], device,tiled=tiled_vae, pbar=False)[0]
-                                    msk[:, :mask_reft_len] = 1
+                                videos = vae.decode(latent[:, 1:].unsqueeze(0).to(device, vae.dtype), device=device, tiled=tiled_vae, pbar=False)[0].cpu()
+                                del latent
 
-                                if msk.shape[1] != temporal_ref_latents.shape[1]:
-                                    if temporal_ref_latents.shape[1] < msk.shape[1]:
-                                        pad_len = msk.shape[1] - temporal_ref_latents.shape[1]
-                                        pad_tensor = temporal_ref_latents[:, -1:].repeat(1, pad_len, 1, 1)
-                                        temporal_ref_latents = torch.cat([temporal_ref_latents, pad_tensor], dim=1)
-                                    else:
-                                        temporal_ref_latents = temporal_ref_latents[:, :msk.shape[1]]
+                                if start != 0:
+                                    videos = videos[:, refert_num:]
 
-                                if ref_latent is not None:
-                                    temporal_ref_latents = torch.cat([msk, temporal_ref_latents], dim=0) # 4+C T H W
-                                    image_cond_in = torch.cat([ref_latent.to(device), temporal_ref_latents], dim=1) # 4+C T+trefs H W
-                                    del temporal_ref_latents, msk, bg_image_slice
-                                else:
-                                    image_cond_in = torch.cat([torch.tile(torch.zeros_like(noise[:1]), [4, 1, 1, 1]), torch.zeros_like(noise)], dim=0).to(device)
+                                sampling_pbar.close()
+
+                                # optional color correction
+                                if colormatch != "disabled":
+                                    videos = videos.permute(1, 2, 3, 0).float().numpy()
+                                    from color_matcher import ColorMatcher
+                                    cm = ColorMatcher()
+                                    cm_result_list = []
+                                    for img in videos:
+                                        cm_result = cm.transfer(src=img, ref=ref_images.permute(1, 2, 3, 0).squeeze(0).cpu().float().numpy(), method=colormatch)
+                                        cm_result_list.append(torch.from_numpy(cm_result).to(vae.dtype))
+                                    videos = torch.stack(cm_result_list, dim=0).permute(3, 0, 1, 2)
+                                    del cm_result_list
+
+                                current_ref_images = videos[:, -refert_num:].clone().detach()
+
+                                # optionally save generated samples to disk
+                                # if output_path:
+                                #     video_np = videos.clamp(-1.0, 1.0).add(1.0).div(2.0).mul(255).cpu().float().numpy().transpose(1, 2, 3, 0).astype('uint8')
+                                #     num_frames_to_save = video_np.shape[0] if is_first_clip else video_np.shape[0] - cur_motion_frames_num
+                                #     log.info(f"Saving {num_frames_to_save} generated frames to {output_path}")
+                                #     start_idx = 0 if is_first_clip else cur_motion_frames_num
+                                #     for i in range(start_idx, video_np.shape[0]):
+                                #         im = Image.fromarray(video_np[i])
+                                #         im.save(os.path.join(output_path, f"frame_{img_counter:05d}.png"))
+                                #         img_counter += 1
+                                # else:
+                                gen_video_list.append(videos)
+
+                                del videos
+
+                                iteration_count += 1
+                                start += frame_window_size - refert_num
+                                end += frame_window_size - refert_num
+                                start_latent += latent_window_size - ((refert_num - 1)// 4 + 1)
+                                end_latent += latent_window_size - ((refert_num - 1)// 4 + 1)
+
+                            if not output_path:
+                                gen_video_samples = torch.cat(gen_video_list, dim=1)
                             else:
-                                image_cond_in = torch.cat([torch.tile(torch.zeros_like(noise[:1]), [4, 1, 1, 1]), torch.zeros_like(noise)], dim=0).to(device)
+                                gen_video_samples = torch.zeros(3, 1, 64, 64) # dummy output
 
-                            pose_input_slice = None
-                            if pose_images is not None:
-                                vae.to(device)
-                                pose_image_slice = pose_images_in[:, start:end].to(device)
-                                pose_input_slice = vae.encode([pose_image_slice], device,tiled=tiled_vae, pbar=False).to(dtype)
+                            if force_offload:
+                                vae.to(offload_device)
+                                if not model["auto_cpu_offload"]:
+                                    offload_transformer(transformer)
+                            try:
+                                print_memory(device)
+                                torch.cuda.reset_peak_memory_stats(device)
+                            except:
+                                pass
+                            return {"video": gen_video_samples.permute(1, 2, 3, 0), "output_path": output_path},
 
-                            vae.to(offload_device)
-
-                            if wananim_face_pixels is None and wananim_ref_masks is not None:
-                                face_images_in = torch.zeros(1, 3, frame_window_size, 512, 512, device=device, dtype=torch.float32)
-                            elif wananim_face_pixels is not None:
-                                face_images_in = face_images[:, :, start:end].to(device, torch.float32) if face_images is not None else None
-
-                            if samples is not None:
-                                input_samples = samples["samples"]
-                                if input_samples is not None:
-                                    input_samples = input_samples.squeeze(0).to(noise)
-                                    # Check if we have enough frames in input_samples
-                                    # if latent_end_idx > input_samples.shape[1]:
-                                    #     # We need more frames than available - pad the input_samples at the end
-                                    #     pad_length = latent_end_idx - input_samples.shape[1]
-                                    #     last_frame = input_samples[:, -1:].repeat(1, pad_length, 1, 1)
-                                    #     input_samples = torch.cat([input_samples, last_frame], dim=1)
-                                    # input_samples = input_samples[:, latent_start_idx:latent_end_idx]
-                                    if noise_mask is not None:
-                                        original_image = input_samples.to(device)
-
-                                    assert input_samples.shape[1] == noise.shape[1], f"Slice mismatch: {input_samples.shape[1]} vs {noise.shape[1]}"
-
-                                    if add_noise_to_samples:
-                                        latent_timestep = timesteps[0]
-                                        noise = noise * latent_timestep / 1000 + (1 - latent_timestep / 1000) * input_samples
-                                    else:
-                                        noise = input_samples
-
-                                # diff diff prep
-                                noise_mask = samples.get("noise_mask", None)
-                                if noise_mask is not None:
-                                    if len(noise_mask.shape) == 4:
-                                        noise_mask = noise_mask.squeeze(1)
-                                    if noise_mask.shape[0] < noise.shape[1]:
-                                        noise_mask = noise_mask.repeat(noise.shape[1] // noise_mask.shape[0], 1, 1)
-                                    else:
-                                        noise_mask = noise_mask[start_latent:end_latent]
-                                    noise_mask = torch.nn.functional.interpolate(
-                                        noise_mask.unsqueeze(0).unsqueeze(0),  # Add batch and channel dims [1,1,T,H,W]
-                                        size=(noise.shape[1], noise.shape[2], noise.shape[3]),
-                                        mode='trilinear',
-                                        align_corners=False
-                                    ).repeat(1, noise.shape[0], 1, 1, 1)
-
-                                    thresholds = torch.arange(len(timesteps), dtype=original_image.dtype) / len(timesteps)
-                                    thresholds = thresholds.reshape(-1, 1, 1, 1, 1).to(device)
-                                    masks = (1-noise_mask.repeat(len(timesteps), 1, 1, 1, 1).to(device)) > thresholds
-
-                            if isinstance(scheduler, dict):
-                                sample_scheduler = copy.deepcopy(scheduler["sample_scheduler"])
-                                timesteps = scheduler["timesteps"]
-                            else:
-                                sample_scheduler, timesteps,_,_ = get_scheduler(scheduler, total_steps, start_step, end_step, shift, device, transformer.dim, denoise_strength, sigmas=sigmas)
-
-                            # sample videos
-                            latent = noise
-
-                            if offloaded:
-                                # Load weights
-                                if transformer.patched_linear and gguf_reader is None:
-                                    load_weights(patcher.model.diffusion_model, patcher.model["sd"], weight_dtype, base_dtype=dtype, transformer_load_device=device, block_swap_args=block_swap_args)
-                                elif gguf_reader is not None: #handle GGUF
-                                    load_weights(transformer, patcher.model["sd"], base_dtype=dtype, transformer_load_device=device, patcher=patcher, gguf=True, reader=gguf_reader, block_swap_args=block_swap_args)
-                                #blockswap init
-                                init_blockswap(transformer, block_swap_args, model)
-
-                            # Use the appropriate prompt for this section
-                            if len(text_embeds["prompt_embeds"]) > 1:
-                                prompt_index = min(iteration_count, len(text_embeds["prompt_embeds"]) - 1)
-                                positive = [text_embeds["prompt_embeds"][prompt_index]]
-                                log.info(f"Using prompt index: {prompt_index}")
-                            else:
-                                positive = text_embeds["prompt_embeds"]
-
-                            # uni3c slices
-                            uni3c_data_input = None
-                            if uni3c_embeds is not None:
-                                render_latent = uni3c_embeds["render_latent"][:,:,start_latent:end_latent].to(device)
-                                if render_latent.shape[2] < noise.shape[1]:
-                                    render_latent = torch.nn.functional.interpolate(render_latent, size=(noise.shape[1], noise.shape[2], noise.shape[3]), mode='trilinear', align_corners=False)
-                                uni3c_data_input = {"render_latent": render_latent}
-                                for k in uni3c_data:
-                                    if k != "render_latent":
-                                        uni3c_data_input[k] = uni3c_data[k]
-
-                            mm.soft_empty_cache()
-                            gc.collect()
-                            # inner WanAnimate sampling loop
-                            sampling_pbar = tqdm(total=len(timesteps), desc=f"Frames {start}-{end}", position=0, leave=True)
-                            for i in range(len(timesteps)):
-                                timestep = timesteps[i]
-                                latent_model_input = latent.to(device)
-
-                                noise_pred, _, self.cache_state = predict_with_cfg(
-                                    latent_model_input, cfg[min(i, len(timesteps)-1)], positive, text_embeds["negative_prompt_embeds"],
-                                    timestep, i, cache_state=self.cache_state, image_cond=image_cond_in, clip_fea=clip_fea, wananim_face_pixels=face_images_in,
-                                    wananim_pose_latents=pose_input_slice, uni3c_data=uni3c_data_input,
-                                 )
-                                if callback is not None:
-                                    callback_latent = (latent_model_input.to(device) - noise_pred.to(device) * t.to(device) / 1000).detach().permute(1,0,2,3)
-                                    callback(step_iteration_count, callback_latent, None, estimated_iterations*(len(timesteps)))
-                                    del callback_latent
-
-                                sampling_pbar.update(1)
-                                step_iteration_count += 1
-
-                                if use_tsr:
-                                    noise_pred = temporal_score_rescaling(noise_pred, latent, timestep, tsr_k, tsr_sigma)
-
-                                latent = sample_scheduler.step(noise_pred.unsqueeze(0), timestep, latent.unsqueeze(0).to(noise_pred.device), **scheduler_step_args)[0].squeeze(0)
-                                del noise_pred, latent_model_input, timestep
-
-                                # differential diffusion inpaint
-                                if masks is not None:
-                                    if i < len(timesteps) - 1:
-                                        image_latent = add_noise(original_image.to(device), noise.to(device), timesteps[i+1])
-                                        mask = masks[i].to(latent)
-                                        latent = image_latent * mask + latent * (1-mask)
-
-                            del noise
-                            if offload:
-                                offload_transformer(transformer, remove_lora=False)
-                                offloaded = True
-
-                            vae.to(device)
-                            videos = vae.decode(latent[:, 1:].unsqueeze(0).to(device, vae.dtype), device=device, tiled=tiled_vae, pbar=False)[0].cpu()
-                            del latent
-
-                            if start != 0:
-                                videos = videos[:, refert_num:]
-
-                            sampling_pbar.close()
-
-                            # optional color correction
-                            if colormatch != "disabled":
-                                videos = videos.permute(1, 2, 3, 0).float().numpy()
-                                from color_matcher import ColorMatcher
-                                cm = ColorMatcher()
-                                cm_result_list = []
-                                for img in videos:
-                                    cm_result = cm.transfer(src=img, ref=ref_images.permute(1, 2, 3, 0).squeeze(0).cpu().float().numpy(), method=colormatch)
-                                    cm_result_list.append(torch.from_numpy(cm_result).to(vae.dtype))
-                                videos = torch.stack(cm_result_list, dim=0).permute(3, 0, 1, 2)
-                                del cm_result_list
-
-                            current_ref_images = videos[:, -refert_num:].clone().detach()
-
-                            # optionally save generated samples to disk
-                            # if output_path:
-                            #     video_np = videos.clamp(-1.0, 1.0).add(1.0).div(2.0).mul(255).cpu().float().numpy().transpose(1, 2, 3, 0).astype('uint8')
-                            #     num_frames_to_save = video_np.shape[0] if is_first_clip else video_np.shape[0] - cur_motion_frames_num
-                            #     log.info(f"Saving {num_frames_to_save} generated frames to {output_path}")
-                            #     start_idx = 0 if is_first_clip else cur_motion_frames_num
-                            #     for i in range(start_idx, video_np.shape[0]):
-                            #         im = Image.fromarray(video_np[i])
-                            #         im.save(os.path.join(output_path, f"frame_{img_counter:05d}.png"))
-                            #         img_counter += 1
-                            # else:
-                            gen_video_list.append(videos)
-
-                            del videos
-
-                            iteration_count += 1
-                            start += frame_window_size - refert_num
-                            end += frame_window_size - refert_num
-                            start_latent += latent_window_size - ((refert_num - 1)// 4 + 1)
-                            end_latent += latent_window_size - ((refert_num - 1)// 4 + 1)
-
-                        if not output_path:
-                            gen_video_samples = torch.cat(gen_video_list, dim=1)
+                        #region normal inference
                         else:
-                            gen_video_samples = torch.zeros(3, 1, 64, 64) # dummy output
-
-                        if force_offload:
-                            vae.to(offload_device)
-                            if not model["auto_cpu_offload"]:
-                                offload_transformer(transformer)
-                        try:
-                            print_memory(device)
-                            torch.cuda.reset_peak_memory_stats(device)
-                        except:
-                            pass
-                        return {"video": gen_video_samples.permute(1, 2, 3, 0), "output_path": output_path},
-
-                    #region normal inference
-                    else:
-                        noise_pred, noise_pred_ovi, self.cache_state = predict_with_cfg(
-                            latent_model_input,
-                            cfg[idx], text_embeds["prompt_embeds"], text_embeds["negative_prompt_embeds"],
-                            timestep, idx, image_cond, clip_fea, control_latents, vace_data, unianim_data, audio_proj, control_camera_latents, add_cond,
-                            cache_state=self.cache_state, fantasy_portrait_input=fantasy_portrait_input, multitalk_audio_embeds=multitalk_audio_embeds, mtv_motion_tokens=mtv_motion_tokens, s2v_audio_input=s2v_audio_input,
-                            humo_image_cond=humo_image_cond, humo_image_cond_neg=humo_image_cond_neg, humo_audio=humo_audio, humo_audio_neg=humo_audio_neg,
-                            wananim_face_pixels=wananim_face_pixels, wananim_pose_latents=wananim_pose_latents, uni3c_data = uni3c_data, latent_model_input_ovi=latent_model_input_ovi, flashvsr_LQ_latent=flashvsr_LQ_latent,
-                        )
-                        if bidirectional_sampling:
-                            noise_pred_flipped, _,self.cache_state = predict_with_cfg(
-                            latent_model_input_flipped,
-                            cfg[idx], text_embeds["prompt_embeds"], text_embeds["negative_prompt_embeds"],
-                            timestep, idx, image_cond, clip_fea, control_latents, vace_data, unianim_data, audio_proj, control_camera_latents, add_cond,
-                            cache_state=self.cache_state, fantasy_portrait_input=fantasy_portrait_input, mtv_motion_tokens=mtv_motion_tokens,reverse_time=True)
-
-                    if latent_shift_loop:
-                        #reverse latent shift
-                        if latent_shift_start_percent <= current_step_percentage <= latent_shift_end_percent:
-                            noise_pred = torch.cat([noise_pred[:, latent_video_length - shift_idx:]] + [noise_pred[:, :latent_video_length - shift_idx]], dim=1)
-                            shift_idx = (shift_idx + latent_skip) % latent_video_length
-
-                    latent = latent.to(device)
-
-                    if self.noise_front_pad_num > 0:
-                        noise_pred = noise_pred[:, self.noise_front_pad_num:]
-
-                    if use_tsr:
-                        noise_pred = temporal_score_rescaling(noise_pred, latent, timestep, tsr_k, tsr_sigma)
-
-                    if transformer.is_longcat:
-                        noise_pred = -noise_pred
-
-                    if len(timestep.shape) != 1 and clean_latent_indices and not is_pusa: #5b and longcat, skip clean latents for scheduler step
-                        step_process_indices = [i for i in range(latent.shape[1]) if i not in clean_latent_indices]
-                        latent[:, step_process_indices] = sample_scheduler.step(noise_pred[:, step_process_indices].unsqueeze(0), orig_timestep,
-                                                        latent[:, step_process_indices].unsqueeze(0), **scheduler_step_args)[0].squeeze(0)
-                    else:
-                        if latents_to_not_step > 0:
-                            raw_latent = latent[:, :latents_to_not_step]
-                            noise_pred_in = noise_pred[:, latents_to_not_step:]
-                            latent = latent[:, latents_to_not_step:]
-                        elif recammaster is not None or mocha_embeds is not None:
-                            noise_pred_in = noise_pred[:, :orig_noise_len]
-                            latent = latent[:, :orig_noise_len]
-                        else:
-                            noise_pred_in = noise_pred
-                        latent = sample_scheduler.step(noise_pred_in.unsqueeze(0), timestep, latent.unsqueeze(0), **scheduler_step_args)[0].squeeze(0)
-                        if noise_pred_flipped is not None:
-                            latent_backwards = sample_scheduler_flipped.step(noise_pred_flipped.unsqueeze(0), timestep, latent_flipped.unsqueeze(0), **scheduler_step_args)[0].squeeze(0)
-                            latent_backwards = torch.flip(latent_backwards, dims=[1])
-                            latent = latent * 0.5 + latent_backwards * 0.5
-                        if latents_to_not_step > 0:
-                            latent = torch.cat([raw_latent, latent], dim=1)
-
-                    if latent_ovi is not None:
-                        latent_ovi = sample_scheduler_ovi.step(noise_pred_ovi.unsqueeze(0), t, latent_ovi.to(device).unsqueeze(0), **scheduler_step_args)[0].squeeze(0)
-
-                    #InfiniteTalk first frame handling
-                    if (extra_latents is not None
-                        and not multitalk_sampling
-                        and transformer.multitalk_model_type=="InfiniteTalk"):
-                        for entry in extra_latents:
-                            add_index = entry["index"]
-                            num_extra_frames = entry["samples"].shape[2]
-                            latent[:, add_index:add_index+num_extra_frames] = entry["samples"].to(latent)
-
-                    # differential diffusion inpaint
-                    if masks is not None:
-                        if idx < len(timesteps) - 1:
-                            noise_timestep = timesteps[idx+1]
-                            image_latent = sample_scheduler.scale_noise(
-                                original_image.to(device), torch.tensor([noise_timestep]), noise.to(device)
+                            noise_pred, noise_pred_ovi, self.cache_state = predict_with_cfg(
+                                latent_model_input,
+                                cfg[idx], text_embeds["prompt_embeds"], text_embeds["negative_prompt_embeds"],
+                                timestep, idx, image_cond, clip_fea, control_latents, vace_data, unianim_data, audio_proj, control_camera_latents, add_cond,
+                                cache_state=self.cache_state, fantasy_portrait_input=fantasy_portrait_input, multitalk_audio_embeds=multitalk_audio_embeds, mtv_motion_tokens=mtv_motion_tokens, s2v_audio_input=s2v_audio_input,
+                                humo_image_cond=humo_image_cond, humo_image_cond_neg=humo_image_cond_neg, humo_audio=humo_audio, humo_audio_neg=humo_audio_neg,
+                                wananim_face_pixels=wananim_face_pixels, wananim_pose_latents=wananim_pose_latents, uni3c_data = uni3c_data, latent_model_input_ovi=latent_model_input_ovi, flashvsr_LQ_latent=flashvsr_LQ_latent,
                             )
-                            mask = masks[idx].to(latent)
-                            latent = image_latent * mask + latent * (1-mask)
+                            if bidirectional_sampling:
+                                noise_pred_flipped, _,self.cache_state = predict_with_cfg(
+                                latent_model_input_flipped,
+                                cfg[idx], text_embeds["prompt_embeds"], text_embeds["negative_prompt_embeds"],
+                                timestep, idx, image_cond, clip_fea, control_latents, vace_data, unianim_data, audio_proj, control_camera_latents, add_cond,
+                                cache_state=self.cache_state, fantasy_portrait_input=fantasy_portrait_input, mtv_motion_tokens=mtv_motion_tokens,reverse_time=True)
 
-                    # TTM
-                    if ttm_reference_latents is not None and (idx + ttm_start_step) < ttm_end_step:
-                        if idx + ttm_start_step + 1 < len(sample_scheduler.all_timesteps):
-                            noisy_latents = add_noise(ttm_reference_latents, noise, sample_scheduler.all_timesteps[idx + ttm_start_step + 1].to(noise.device)).to(latent)
-                            latent = latent * (1 - motion_mask) + noisy_latents * motion_mask
+                        if latent_shift_loop:
+                            #reverse latent shift
+                            if latent_shift_start_percent <= current_step_percentage <= latent_shift_end_percent:
+                                noise_pred = torch.cat([noise_pred[:, latent_video_length - shift_idx:]] + [noise_pred[:, :latent_video_length - shift_idx]], dim=1)
+                                shift_idx = (shift_idx + latent_skip) % latent_video_length
+
+                        latent = latent.to(device)
+
+                        if self.noise_front_pad_num > 0:
+                            noise_pred = noise_pred[:, self.noise_front_pad_num:]
+
+                        if use_tsr:
+                            noise_pred = temporal_score_rescaling(noise_pred, latent, timestep, tsr_k, tsr_sigma)
+
+                        if transformer.is_longcat:
+                            noise_pred = -noise_pred
+
+                        if len(timestep.shape) != 1 and clean_latent_indices and not is_pusa: #5b and longcat, skip clean latents for scheduler step
+                            step_process_indices = [i for i in range(latent.shape[1]) if i not in clean_latent_indices]
+                            latent[:, step_process_indices] = sample_scheduler.step(noise_pred[:, step_process_indices].unsqueeze(0), orig_timestep,
+                                                            latent[:, step_process_indices].unsqueeze(0), **scheduler_step_args)[0].squeeze(0)
                         else:
-                            latent = latent * (1 - motion_mask) + ttm_reference_latents.to(latent) * motion_mask
+                            if latents_to_not_step > 0:
+                                raw_latent = latent[:, :latents_to_not_step]
+                                noise_pred_in = noise_pred[:, latents_to_not_step:]
+                                latent = latent[:, latents_to_not_step:]
+                            elif recammaster is not None or mocha_embeds is not None:
+                                noise_pred_in = noise_pred[:, :orig_noise_len]
+                                latent = latent[:, :orig_noise_len]
+                            else:
+                                noise_pred_in = noise_pred
+                            latent = sample_scheduler.step(noise_pred_in.unsqueeze(0), timestep, latent.unsqueeze(0), **scheduler_step_args)[0].squeeze(0)
+                            if noise_pred_flipped is not None:
+                                latent_backwards = sample_scheduler_flipped.step(noise_pred_flipped.unsqueeze(0), timestep, latent_flipped.unsqueeze(0), **scheduler_step_args)[0].squeeze(0)
+                                latent_backwards = torch.flip(latent_backwards, dims=[1])
+                                latent = latent * 0.5 + latent_backwards * 0.5
+                            if latents_to_not_step > 0:
+                                latent = torch.cat([raw_latent, latent], dim=1)
 
-                    if freeinit_args is not None:
-                        current_latent = latent.clone()
+                        if latent_ovi is not None:
+                            latent_ovi = sample_scheduler_ovi.step(noise_pred_ovi.unsqueeze(0), t, latent_ovi.to(device).unsqueeze(0), **scheduler_step_args)[0].squeeze(0)
 
-                    if callback is not None:
-                        if recammaster is not None or mocha_embeds is not None:
-                            callback_latent = (latent_model_input[:, :orig_noise_len].to(device) - noise_pred[:, :orig_noise_len].to(device) * t.to(device) / 1000).detach()
-                        #elif phantom_latents is not None:
-                        #    callback_latent = (latent_model_input[:,:-phantom_latents.shape[1]].to(device) - noise_pred[:,:-phantom_latents.shape[1]].to(device) * t.to(device) / 1000).detach()
-                        elif humo_reference_count > 0:
-                            callback_latent = (latent_model_input[:,:-humo_reference_count].to(device) - noise_pred[:,:-humo_reference_count].to(device) * t.to(device) / 1000).detach()
-                        elif "rcm" in sample_scheduler.__class__.__name__.lower():
-                            callback_latent = (latent_model_input.to(device) - noise_pred.to(device) * t.to(device)).detach()
+                        #InfiniteTalk first frame handling
+                        if (extra_latents is not None
+                            and not multitalk_sampling
+                            and transformer.multitalk_model_type=="InfiniteTalk"):
+                            for entry in extra_latents:
+                                add_index = entry["index"]
+                                num_extra_frames = entry["samples"].shape[2]
+                                latent[:, add_index:add_index+num_extra_frames] = entry["samples"].to(latent)
+
+                        # differential diffusion inpaint
+                        if masks is not None:
+                            if idx < len(timesteps) - 1:
+                                noise_timestep = timesteps[idx+1]
+                                image_latent = sample_scheduler.scale_noise(
+                                    original_image.to(device), torch.tensor([noise_timestep]), noise.to(device)
+                                )
+                                mask = masks[idx].to(latent)
+                                latent = image_latent * mask + latent * (1-mask)
+
+                        # TTM
+                        if ttm_reference_latents is not None and (idx + ttm_start_step) < ttm_end_step:
+                            if idx + ttm_start_step + 1 < len(sample_scheduler.all_timesteps):
+                                noisy_latents = add_noise(ttm_reference_latents, noise, sample_scheduler.all_timesteps[idx + ttm_start_step + 1].to(noise.device)).to(latent)
+                                latent = latent * (1 - motion_mask) + noisy_latents * motion_mask
+                            else:
+                                latent = latent * (1 - motion_mask) + ttm_reference_latents.to(latent) * motion_mask
+
+                        if freeinit_args is not None:
+                            current_latent = latent.clone()
+
+                        if callback is not None:
+                            if recammaster is not None or mocha_embeds is not None:
+                                callback_latent = (latent_model_input[:, :orig_noise_len].to(device) - noise_pred[:, :orig_noise_len].to(device) * t.to(device) / 1000).detach()
+                            #elif phantom_latents is not None:
+                            #    callback_latent = (latent_model_input[:,:-phantom_latents.shape[1]].to(device) - noise_pred[:,:-phantom_latents.shape[1]].to(device) * t.to(device) / 1000).detach()
+                            elif humo_reference_count > 0:
+                                callback_latent = (latent_model_input[:,:-humo_reference_count].to(device) - noise_pred[:,:-humo_reference_count].to(device) * t.to(device) / 1000).detach()
+                            elif "rcm" in sample_scheduler.__class__.__name__.lower():
+                                callback_latent = (latent_model_input.to(device) - noise_pred.to(device) * t.to(device)).detach()
+                            else:
+                                callback_latent = (latent_model_input.to(device) - noise_pred.to(device) * t.to(device) / 1000).detach()
+                            callback(idx, callback_latent.permute(1,0,2,3), None, len(timesteps))
                         else:
-                            callback_latent = (latent_model_input.to(device) - noise_pred.to(device) * t.to(device) / 1000).detach()
-                        callback(idx, callback_latent.permute(1,0,2,3), None, len(timesteps))
-                    else:
-                        pbar.update(1)
+                            pbar.update(1)
 
             except Exception as e:
                 log.error(f"Error during sampling: {e}")

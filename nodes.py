@@ -8,6 +8,7 @@ from .utils import(log, clip_encode_image_tiled, add_noise_to_reference_video, s
 from .taehv import TAEHV
 
 from comfy import model_management as mm
+from comfy_api.latest import io
 from comfy.utils import ProgressBar, common_upscale
 from comfy.clip_vision import clip_preprocess, ClipVisionModel
 import folder_paths
@@ -2069,6 +2070,76 @@ class WanVideoAddTTMLatents:
 
         return (updated,)
 
+#region self-refine-video
+class WanVideoSelfRefineVideo(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        # Default values for each range
+        default_ranges = [
+            (2, 5, 3),   # Range 1
+            (6, 14, 1),  # Range 2
+            (6, 14, 1),   # Range 3
+            (6, 14, 1),   # Range 4
+            (6, 14, 1),   # Range 5
+        ]
+
+        options = []
+        for num_ranges in range(1, 6):  # 1 to 5 ranges
+            range_inputs = []
+            for i in range(1, num_ranges + 1):
+                start_default, end_default, steps_default = default_ranges[i - 1]
+                range_inputs.extend([
+                    io.Int.Input(f"start_step{i}", default=start_default, min=0, max=999, step=1, tooltip=f"Start step for range {i}"),
+                    io.Int.Input(f"end_step{i}", default=end_default, min=0, max=999, step=1, tooltip=f"End step for range {i}"),
+                    io.Int.Input(f"steps_{i}", default=steps_default, min=1, max=100, step=1, tooltip=f"Number of P&P steps for range {i}"),
+                ])
+            options.append(io.DynamicCombo.Option(
+                key=str(num_ranges),
+                inputs=range_inputs
+            ))
+
+        return io.Schema(
+            node_id="WanVideoSelfRefineVideo",
+            category="WanVideoWrapper",
+            description="https://github.com/agwmon/self-refine-video - Configure stochastic plan for Perturb-and-Project sampling",
+            inputs=[
+                io.Custom("WANVIDIMAGE_EMBEDS").Input("embeds", tooltip="Image embeddings to update"),
+                io.Float.Input(
+                    "uncertainty_threshold",
+                    default=0.25, min=0.0, max=1.0, step=0.01,
+                    tooltip="Lower values make it harder for regions to be considered \"certain\", meaning more pixels will continue being refined. Higher values make it easier to lock in pixels early."
+                ),
+                io.Float.Input("certain_percentage", default=0.999, min=0.0, max=1.0, step=0.001, tooltip="Higher values = stricter requirement = fewer early stops = more iterations"),
+                io.DynamicCombo.Input("num_ranges", options=options, display_name="Number of Ranges", tooltip="Number of step ranges to configure for the stochastic plan"),
+            ],
+            outputs=[
+                io.Custom("WANVIDIMAGE_EMBEDS").Output(display_name="image_embeds", tooltip="Updated image embeddings with self-refine parameters"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, embeds, uncertainty_threshold, certain_percentage, num_ranges) -> io.NodeOutput:
+        updated = dict(embeds)
+        updated["self_refine_uncertainty_threshold"] = uncertainty_threshold
+        updated["self_refine_certain_percentage"] = certain_percentage
+
+        # Build stochastic plan from the dynamic inputs in list format: [(start, end, steps), ...]
+        stochastic_plan = []
+        range_keys = sorted([k for k in num_ranges.keys() if k.startswith('start_step')])
+
+        for start_key in range_keys:
+            i = start_key.replace('start_step', '')
+            start = num_ranges.get(f"start_step{i}")
+            end = num_ranges.get(f"end_step{i}")
+            steps = num_ranges.get(f"steps_{i}")
+
+            if start is not None and end is not None and steps is not None:
+                stochastic_plan.append((start, end, steps))
+
+        updated["stochastic_plan"] = stochastic_plan
+
+        return io.NodeOutput(updated)
+
 #region VideoDecode
 class WanVideoDecode:
     @classmethod
@@ -2323,6 +2394,7 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoAddTTMLatents": WanVideoAddTTMLatents,
     "WanVideoAddStoryMemLatents": WanVideoAddStoryMemLatents,
     "WanVideoSVIProEmbeds": WanVideoSVIProEmbeds,
+    "WanVideoSelfRefineVideo": WanVideoSelfRefineVideo,
     }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
