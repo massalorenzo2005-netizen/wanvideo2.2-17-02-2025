@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import os, gc, uuid
-from .utils import log, apply_lora
+from .utils import log, apply_lora, hard_offload_transformer
 import numpy as np
 from tqdm import tqdm
 import re
@@ -10,13 +10,14 @@ from .wanvideo.modules.model import WanModel, LoRALinearLayer, WanRMSNorm
 from .wanvideo.modules.t5 import T5EncoderModel
 from .wanvideo.modules.clip import CLIPModel
 from .wanvideo.wan_video_vae import WanVideoVAE, WanVideoVAE38
-from .custom_linear import _replace_linear
+from .custom_linear import _replace_linear, set_shot_lora_params
 
 from accelerate import init_empty_weights
 from .utils import set_module_tensor_to_device, get_module_memory_mb_per_device
 
 import folder_paths
 import comfy.model_management as mm
+from comfy.patcher_extension import CallbacksMP
 from comfy.utils import load_torch_file, ProgressBar
 import comfy.model_base
 from comfy.sd import load_lora_for_models
@@ -1390,8 +1391,16 @@ class WanVideoModelLoader:
                 model_variant = "i2v_14B_2.2"
             else:
                 model_variant = "14B_2.2"
-
+        
         log.info(f"Model variant detected: {model_variant}")
+
+        shot_embedding_entries = 0
+        use_shot_embedding = False
+        shot_embedding_weight = sd.get("shot_embedding.weight")
+        if shot_embedding_weight is not None:
+            shot_embedding_entries = int(shot_embedding_weight.shape[0])
+            use_shot_embedding = shot_embedding_entries > 0
+            log.info(f"Detected shot embedding weights: {shot_embedding_entries}")
 
         TRANSFORMER_CONFIG= {
             "dim": dim,
@@ -1431,6 +1440,9 @@ class WanVideoModelLoader:
             "lynx_ip_layers": lynx_ip_layers,
             "lynx_ref_layers": lynx_ref_layers,
             "is_longcat": dim == 4096,
+            "max_shots": shot_embedding_entries,
+            "use_shot_embedding": use_shot_embedding,
+            "shot_embedding_init": "zeros",
 
         }
 
@@ -1443,6 +1455,8 @@ class WanVideoModelLoader:
                 "patch_size": [1],
                 "in_dim": 20,
                 "out_dim": 20,
+                "use_shot_embedding": False,
+                "max_shots": 0,
                 })
 
             with init_empty_weights():
@@ -1695,6 +1709,29 @@ class WanVideoModelLoader:
         comfy_model.load_device = transformer_load_device
         patcher = comfy.model_patcher.ModelPatcher(comfy_model, device, offload_device)
         patcher.model.is_patched = False
+
+        def _clear_shot_lora(model_patcher, unpatch_all=None):
+            try:
+                transformer_mod = model_patcher.model.diffusion_model
+            except Exception:
+                return
+            try:
+                set_shot_lora_params(transformer_mod, {})
+                if hasattr(transformer_mod, "shot_lora_count"):
+                    transformer_mod.shot_lora_count = 0
+            except Exception as exc:
+                log.warning(f"Failed to clear per-shot LoRA: {exc}")
+                return
+
+            if unpatch_all:
+                try:
+                    hard_offload_transformer(transformer_mod, remove_lora=True)
+                except Exception as exc:
+                    log.warning(f"Failed to hard offload transformer during per-shot cleanup: {exc}")
+
+        patcher.add_callback(CallbacksMP.ON_DETACH, _clear_shot_lora)
+        patcher.add_callback(CallbacksMP.ON_EJECT_MODEL, _clear_shot_lora)
+        patcher.add_callback(CallbacksMP.ON_CLEANUP, _clear_shot_lora)
 
         scale_weights = {}
         if "fp8" in quantization:
