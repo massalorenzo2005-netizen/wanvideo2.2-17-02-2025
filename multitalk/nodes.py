@@ -352,7 +352,7 @@ class MultiTalkSilentEmbeds:
     def INPUT_TYPES(s):
         return {"required": {
             "num_frames": ("INT", {"default": 81, "min": 1, "max": 10000, "step": 1, "tooltip": "The total frame count to generate."}),
-            "audio_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.05, "tooltip": "Strength of the silence conditioning. Higher = stronger mouth closing effect."}),
+            "audio_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step": 0.01, "tooltip": "Strength of the audio conditioning"}),
         },
         }
 

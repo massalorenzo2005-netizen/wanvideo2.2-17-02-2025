@@ -1343,6 +1343,8 @@ class WanAttentionBlock(nn.Module):
                         if audio_output_cond is not None:
                             x_audio = torch.cat([audio_output_cond, x_audio], dim=1).contiguous()
                     else:
+                        # audio temporal frames may differ from grid_sizes when external conditioning
+                        # (e.g. SCAIL pose ref_latent) modifies the spatial-temporal token layout
                         x_normed = self.norm_x(x.to(self.norm_x.weight.dtype)).to(input_dtype)
                         N_h, N_w = grid_sizes[0][1].item(), grid_sizes[0][2].item()
                         S = N_h * N_w
@@ -1350,7 +1352,8 @@ class WanAttentionBlock(nn.Module):
                         audio_tokens = audio_N_t * S
                         if grid_sizes[0][0].item() != audio_N_t or x_normed.shape[1] != audio_tokens:
                             x_for_audio = x_normed[:, :audio_tokens]
-                            audio_shape = torch.tensor([audio_N_t, N_h, N_w], device=grid_sizes.device, dtype=grid_sizes.dtype)
+                            audio_shape = grid_sizes[0].clone()
+                            audio_shape[0] = audio_N_t
                         else:
                             x_for_audio = x_normed
                             audio_shape = grid_sizes[0]
