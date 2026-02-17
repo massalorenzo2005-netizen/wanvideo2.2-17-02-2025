@@ -1,32 +1,20 @@
 FROM runpod/comfyui:latest-5090
 
-USER root
-RUN apt-get update && apt-get install -y rclone && rm -rf /var/lib/apt/lists/*
+# 1. Install GCSFuse
+RUN apt-get update && apt-get install -y gnupg2 curl && \
+    export GCSFUSE_REPO=gcsfuse-`lsb_release -c -s` && \
+    echo "deb https://packages.cloud.google.com/apt $GCSFUSE_REPO main" | tee /etc/apt/sources.list.d/gcsfuse.list && \
+    curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add - && \
+    apt-get update && apt-get install -y gcsfuse && \
+    rm -rf /var/lib/apt/lists/*
 
-# 1. Creiamo la chiave dal tuo codice Base64
-RUN echo "ewogICJ0eXBlIjogInNlcnZpY2VfYWNjb3VudCIsCiAgInByb2plY3RfaWQiOiAiZ2VuLWxhbmctY2xpZW50LTAyNjE0OTMwMjMiLAogICJwcml2YXRlX2tleV9pZCI6ICI1ODg5YjA2Yjg2Nzk0MzE5ZTI0NWU2NWQ5ZWEzNGFlN2YwOWQyMzlmIiwKICAicHJpdmF0ZV9rZXkiOiAiLS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0tXG5NSUlFdmdJQkFEQU5CZ2txaGtpRzl3MEJBUUVGQUFTQ0JLZ3dnZ1NrQWdFQUFvSUJBUURlMmxmdVF0SXQ0a3h4XG5jaVYwYnpydE5jZEI2dG9pZmdaSVd0QWg4dmhGbGhSVXFyQW9ZQ3FYd2hOUlhzV3l0eWdDYlJMVjFTeE5vU3drXG5GRWl5RVBIQm00NTN0bmZMVEhBL1YxanM0b01qYTBEY0E4TEgvV3pqNWNUU0RWa2NjczIxeEg3ZkxvRTgxMmt1XG5YZVNHOWxrekUxOGxCL2JNcm1TWnZ5cXdEUCtXNUlUMkY0VktQRXBnMEpHa3ZaamFMUngwNFhjcG5qaEp4dzJqXG50NEgzd25DWjlJcWltaDRIdjRtSkdaNjBZQ3o3VmtlZjhSSStUNjlqZlppeTNlOFk2MFJvUWtmMDRDVG1RaUxRXG5yU3c1WTFTUWVhdWk5c2xZSVFjMC8xYXNsVlk0amtCL2loMU9scWhsNzc0SHVuVzJpbVkrMzhUZ3FrTzFSWEFSXG5GMURzdVF4ZkFnTUJBQUVDZ2dFQU8rK0pXcUZLR2VFVklpWExBUWV4VjM3eE9qOUpyNkVwVzJoaE5lQTgrYW9sXG5pYWZtZk5Wd1h5UnBRYWMxa0oxRiszRU9jY2hGaEJObTVjVTJ6LzFTcC9tSVZaWVRuZS9PK0pvclpucDlQcGRuXG4rRVJpckpyeUlGRDVvR3pLbktZYndWazVyaGk1MVgweDRyQ0o5K3BsanlFVW84Y0NqNFlQdEhIL3J4MnYyQXJaXG5IMFN0RWRjWUtYWHN6WGRhZitjUFFhbGd1QVV2N3JIMFp5UDd4MXphYW14Y2pUS0hGc1V1TDBBNllueDNUYkhGXG4xT3dkMG5ibk5sU1dHVGZMNXVVT2R5bzZocFpJTERtZFBMNkhnOTBISmVENlc5UEk3eVFoTit5UDkwOXhmeGV3XG4wU1JsOS9yNTRhcjNVZHpUejNpTkZnbEM3S1g1SVNpV1p0ODZ6SVprOFFLQmdRRCs3VmUwR09HcklqcGFURitBXG44UE9JZ1dSRENYRGJTdlZHdzd3ZHhMb3FLbExyY2lKcXdXUDZNenByT1RSL3R4UythT3RGQ3Y0NlV3NlBxeDkrXG44OGdodlhoWUxibE1ReU1ic091VEo1ajJoSHJpcC9HTjYwVEJYMmhIMU9xNEpzd0sydThzQnN4VEIwUS9RejM5XG5XUVZGRlp0d0hVN3JGTGJjbG1aVWF0QjN5d0tCZ1FEZnluRzdNaW82WWJ2TTdCTUlxL0NtajNlMVFMWmFzOHBFXG5PdXo0WWZiM081RG5zeFNyNkNhdHZnK2hJSC9jYU1EeWlHcDRtckNCekdDUUtoU0ZJd0M1QzUvd0RudGRhSUZrXG5aRmVLT0dNc21CQVlIK2pJZUFkSm80c21YNGhVUUNqN2tGN0VtVjlhQ1lTVjZDQS9YbXBQWmFjVWtYOVhBMXB3XG4rbVJHZnd0alBRS0JnUUN5bWVBWE9sTm9qVnRxaGhWbkJlanBHeFgrYlcvWEE0WWlKT0gzelN0TWZVaUkwZmJRXG42bHE4SVFYdHR5OVR4eFhPYlQxZnF0c0FTODVvMDFBR3BvN3hMSWhTNXYzcU15TTJ0RlhuVEJlN3BvZGRvcUgyXG5kdjA5cVRVckZqMjM5TjZCUUcvT1haanJGcTAyMFVwdDQ5OXdUam9QYTBrdUk5NFZYMzJqNlEzU3p3S0JnUURWXG5xb2dqM3FXSzBEMXFUZ3R1UUJ1b0sxcHo1N0V6c0d6eDhBREl0V0FDZFJESTU2Wlk2M0hpZUpDYm1sZjVyTnByXG50ZXRSOHYrTExnTVVJZGt0dEZuQVUyVUU0ZzdQQkRSbUVaZXpGRnM3L0lPQlJSWVFNT2xrV1kxRnVmaUQyQzVJXG40WEpaNnNXclJXTWRiVjg4b1h5SENkc1lQRUtFWldNNGN4akNaaElOVVFLQmdDUHNrdzRld0pIanZVUmtQdWpSXG5sR3gvVTF1ODVxalorNGpxY0RtNG5sbnJ6YS96MjRiSTdGcy9MNkw3RzE1bm4zeWwwWmFTSUF4aUNNUG9CN2ZXXG5OWnJmcHV0QTNqUklUbk5YamNVdG1DZVlhM3MwQTRESUNMMU1EbkxWU01VYy9Id1dzNG8wdGFVVEp4b0U2UGQrXG5leXkvVXRFY0VuaEZYMEhsbGo1QlFic0Zcbi0tLS0tRU5EIFBSSVZBVEUgS0VZLS0tLS1cbiIsCiAgImNsaWVudF9lbWFpbCI6ICJydW5wb2Qtd29ya2VyQGdlbi1sYW5nLWNsaWVudC0wMjYxNDkzMDIzLmlhbS5nc2VydmljZWFjY291bnQuY29tIiwKICAiY2xpZW50X2lkIjogIjEwMTE1NTQwNzM0MjEwNjg2NTIzNSIsCiAgImF1dGhfdXJpIjogImh0dHBzOi8vYWNjb3VudHMuZ29vZ2xlLmNvbS9vL29hdXRoMi9hdXRoIiwKICAidG9rZW5fdXJpIjogImh0dHBzOi8vb2F1dGgyLmdvb2dsZWFwaXMuY29tL3Rva2VuIiwKICAiYXV0aF9wcm92aWRlcl94NTA5X2NlcnRfdXJsIjogImh0dHBzOi8vd3d3Lmdvb2dsZWFwaXMuY29tL29hdXRoMi92MS9jZXJ0cyIsCiAgImNsaWVudF94NTA5X2NlcnRfdXJsIjogImh0dHBzOi8vd3d3Lmdvb2dsZWFwaXMubmV0L3JvYm90L3YxL21ldGFkYXRhL3g1MDkvcnVucG9kLXdvcmtlciU0MGdlbi1sYW5nLWNsaWVudC0wMjYxNDkzMDIzLmlhbS5nc2VydmljZWFjY291bnQuY29tIiwKICAidW5pdmVyc2VfZG9tYWluIjogImdvb2dsZWFwaXMuY29tIgp9Cg==" | base64 -d > /google_key.json
+# 2. Copia script di avvio e handler
+COPY start.sh /start.sh
+COPY model_cacher.py /model_cacher.py
+COPY rp_handler.py /rp_handler.py
+COPY extra_model_paths.yaml /ComfyUI/extra_model_paths.yaml
 
-# ⚠️ QUESTA RIGA COSTRINGE GOOGLE A USARE LA CHIAVE
-ENV GOOGLE_APPLICATION_CREDENTIALS=/google_key.json
+RUN chmod +x /start.sh
 
-# 3. Configurazione Mother Ship
-RUN echo '#!/bin/bash\n\
-mkdir -p ~/.config/rclone\n\
-echo "[gcs]\ntype = google cloud storage\nservice_account_file = /google_key.json" > ~/.config/rclone/rclone.conf\n\
-\n\
-echo "[Elite] Controllo disponibilità su Google Mother Ship..."\n\
-if rclone ls gcs:runpodwanvideo2214022026/checkpoints | grep "wan"; then\n\
-    echo "[Elite] Modelli trovati! Download turbo..."\n\
-    rclone copy gcs:runpodwanvideo2214022026/ /ComfyUI/models/ --progress --transfers 8\n\
-else\n\
-    echo "[Elite] Google vuoto. Scarico i modelli normalmente..."\n\
-    # Se vuoi che li carichi su Google dopo averli scaricati la prima volta, devi aggiungere qui il comando copy inverso\n\
-fi\n\
-exec python3 -u /rp_handler.py' > /start_elite.sh && chmod +x /start_elite.sh
-
-WORKDIR /ComfyUI/custom_nodes/ComfyUI-WanVideoWrapper
-COPY . .
-RUN pip install --no-cache-dir -r requirements.txt
-
-WORKDIR /
-ENTRYPOINT ["/start_elite.sh"]
+# 3. Entrypoint
+CMD ["/start.sh"]
